@@ -1,0 +1,20 @@
+{
+  "name": "docwrap",
+  "version": "0.1.0",
+  "description": "Install the docwrap commit-time docstring wrapping hook for Codex.",
+  "author": {
+    "name": "docwrap contributors"
+  },
+  "license": "MIT",
+  "keywords": ["docstrings", "formatting", "hooks", "python"],
+  "interface": {
+    "displayName": "docwrap",
+    "shortDescription": "Commit-time Python docstring wrapping",
+    "longDescription": "Installs a docwrap hook that wraps staged Python docstrings before supported agent commits and denies unsupported commit commands, preserving docstring style and partial staging.",
+    "developerName": "docwrap contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Wrap Python docstrings in this repository."],
+    "screenshots": []
+  }
+}

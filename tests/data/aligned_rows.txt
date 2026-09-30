@@ -1,0 +1,25 @@
+"""The fixed 25-question bake-off set, with computed ground truth.
+
+Each question carries:
+
+*   the natural-language prompt a model receives;
+*   a ground-truth function that recomputes the answer from the seeded dataset,
+    so the expected answer is never a hard-coded literal that can drift;
+*   a uniqueness specification that `runner --selftest` checks, which is how
+    the experiment stays honest: a question with two defensible answers, or
+    with an empty or all-inclusive answer, is not a measurement;
+*   reference tool calls for both surfaces, so the scoring machinery can be
+    exercised end to end without a model.
+
+Answer kinds
+------------
+
+`records`          an unordered set of entities, compared by identity
+`ordered_records`  the same, but the order of the rows is part of the answer
+`record`           one entity plus the field values the question asked for
+`scalar`           a single number
+`mapping`          a rollup, possibly nested; keys are canonicalised before
+                   comparison so grouping by `sg_sequence` and by
+                   `sg_sequence.Sequence.code` score the same
+`error`            the correct behaviour is a surfaced schema error, not rows
+"""

@@ -1,0 +1,2 @@
+[entry-points."docwrap.hook_adapters"]
+claude = "plugins.claude._docwrap._adapter:ClaudeAdapter"

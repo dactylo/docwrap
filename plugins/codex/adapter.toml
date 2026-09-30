@@ -1,0 +1,2 @@
+[entry-points."docwrap.hook_adapters"]
+codex = "plugins.codex._docwrap._adapter:CodexAdapter"

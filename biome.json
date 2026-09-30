@@ -1,0 +1,23 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+  "formatter": {
+    "useEditorconfig": true,
+    "includes": [
+      "biome.json",
+      ".agents/plugins/marketplace.json",
+      ".claude-plugin/marketplace.json",
+      "plugins/*/*.json",
+      "plugins/*/.claude-plugin/*.json",
+      "plugins/*/.codex-plugin/*.json",
+      "plugins/*/hooks/*.json",
+      "plugins/*/tests/**/*.json",
+      "tests/**/*.json",
+      "src/**/*.json"
+    ]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  }
+}

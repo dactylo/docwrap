@@ -1,0 +1,2 @@
+[entry-points."docwrap.hook_adapters"]
+agy = "plugins.agy._docwrap._adapter:AntigravityAdapter"

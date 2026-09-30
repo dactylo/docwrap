@@ -1,0 +1,10 @@
+{
+  "name": "docwrap",
+  "version": "0.1.0",
+  "description": "Install the docwrap commit-time docstring wrapping hook for Claude Code.",
+  "author": {
+    "name": "docwrap contributors"
+  },
+  "license": "MIT",
+  "keywords": ["docstrings", "formatting", "hooks", "python"]
+}

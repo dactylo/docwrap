@@ -1,0 +1,10 @@
+- id: docwrap
+  name: docwrap
+  entry: docwrap --write
+  language: python
+  types: [python]
+- id: docwrap-check
+  name: docwrap (check only)
+  entry: docwrap
+  language: python
+  types: [python]
