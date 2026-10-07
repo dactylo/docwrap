@@ -25,7 +25,7 @@ AMEND_COMMAND = (
     'GIT_COMMITTER_DATE="$(git log -1 --format=%aI)" git commit --amend'
     " -m 'docs: amended subject' -m 'Amended body.'"
 )
-CORPUS = Path(__file__).parent / 'data' / 'commit_classification.json'
+CORPUS = Path(__file__).parent / 'hookshell' / 'data' / 'commit_classification.json'
 DIRECT_COMMAND = "git commit -m 'probe: direct commit'"
 HEREDOC_COMMAND = (
     "git add sample.py && git commit -m \"$(cat <<'EOF'\n"
@@ -36,15 +36,15 @@ HEREDOC_COMMAND = (
     ')"'
 )
 INCIDENT_FILES = (
-    'src/sequential_hooks/_adapters/_common.py',
-    'src/sequential_hooks/_containment/__init__.py',
-    'src/sequential_hooks/_containment/_posix.py',
-    'src/sequential_hooks/_containment/_uncontained.py',
-    'src/sequential_hooks/_containment/_windows.py',
-    'src/sequential_hooks/_containment/_windows_api.py',
-    'src/sequential_hooks/_doctor/__init__.py',
-    'src/sequential_hooks/_doctor/_types.py',
-    'src/sequential_hooks/_runner.py',
+    'src/example/_adapters/_common.py',
+    'src/example/_containment/__init__.py',
+    'src/example/_containment/_posix.py',
+    'src/example/_containment/_uncontained.py',
+    'src/example/_containment/_windows.py',
+    'src/example/_containment/_windows_api.py',
+    'src/example/_doctor/__init__.py',
+    'src/example/_doctor/_types.py',
+    'src/example/_runner.py',
 )
 INCIDENT_COMMAND = (
     "git commit -m 'docs: correct reviewed docstring contracts' -m 'Apply the 15 accepted"
@@ -90,6 +90,9 @@ class Harness:
     def git(self, *args: str) -> str:
         return decode_text(run_setup(['git', *args], cwd=self.repo, env=self.env).stdout)
 
+    def git_bytes(self, *args: str) -> bytes:
+        return run_setup(['git', *args], cwd=self.repo, env=self.env).stdout
+
     def hook(
         self, command: str, *extra: str, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
@@ -107,9 +110,6 @@ class Harness:
             cwd=self.repo,
             env=merged,
         )
-
-    def git_bytes(self, *args: str) -> bytes:
-        return run_setup(['git', *args], cwd=self.repo, env=self.env).stdout
 
     def assert_fixed_point(self, path: str, ref: str = 'HEAD') -> str:
         blob = self.git('show', f'{ref}:{path}')

@@ -5,7 +5,7 @@ from typing import Literal
 
 import pytest
 
-from docwrap._hosts import AdapterLoadError, _registered_hosts, load_adapter
+from docwrap._hosts import AdapterLoadError, load_adapter, registered_host_names
 from docwrap.hooks import HookAdapter, HookInput, HookResponse, HookResult
 from tests.helpers import BUILTIN_ENTRY_POINTS, EXAMPLE_ENTRY_POINTS, register_distribution
 from tests.hosts_example.adapter import (
@@ -27,7 +27,7 @@ PAYLOAD = json.dumps(
 @pytest.mark.usefixtures('registered_hosts')
 class TestDiscovery:
     def test_bundled_adapters_are_registered_through_plugin_manifests(self) -> None:
-        assert _registered_hosts() == sorted(BUILTIN_ENTRY_POINTS)
+        assert registered_host_names() == sorted(BUILTIN_ENTRY_POINTS)
         for name in BUILTIN_ENTRY_POINTS:
             assert load_adapter(name).name == name
 
@@ -44,7 +44,7 @@ class TestDiscovery:
         del example_hosts
         adapter = load_adapter('example')
         assert adapter.name == 'example'
-        assert 'example' in _registered_hosts()
+        assert 'example' in registered_host_names()
 
     def test_unimportable_adapter_is_refused(self, example_hosts: Path) -> None:
         del example_hosts

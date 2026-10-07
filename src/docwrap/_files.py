@@ -2,13 +2,13 @@
 
 import io
 import os
-import subprocess
 import sys
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 
-from docwrap._git_utils import git_executable
+from docwrap._color import visible_controls
+from docwrap._git_utils import git_failure_detail, run_git_command_bytes
 from docwrap._types import Newline
 
 _SKIP_DIRS = frozenset(
@@ -45,34 +45,64 @@ class ReadResult:
     encoding: str
 
 
-def _filter_git_ignored(directory: Path, files: list[Path]) -> list[Path]:
-    """Remove Git-ignored paths while retaining the input on Git failure."""
+class RestoreError(OSError):
+    """A failed write whose original bytes could not be restored.
+
+    The original write error remains available as `__cause__`, and `errno`
+    retains its error number. The message includes both the write and restore
+    failures so callers that display the exception can describe the damage.
+    """
+
+
+def _filter_git_ignored(directory: Path, files: list[Path]) -> tuple[list[Path], str | None]:
+    """Remove Git-ignored paths and return a failure detail when filtering fails."""
     if not files:
-        return files
+        return files, None
     relative_files = [(path, os.fsencode(os.path.relpath(path, directory))) for path in files]
-    try:
-        executable = git_executable()
-        if executable is None:
-            return files
-        result = subprocess.run(
-            [  # noqa: S607
-                'git',
-                'check-ignore',
-                '-z',
-                '--stdin',
-            ],
-            executable=executable,
-            capture_output=True,
-            cwd=directory,
-            input=b'\0'.join(raw_path for _, raw_path in relative_files) + b'\0',
-            check=False,
-        )
-    except OSError:
-        return files
-    if result.returncode not in (0, 1):
-        return files
+    result = run_git_command_bytes(
+        ['git', 'check-ignore', '-z', '--stdin'],
+        directory,
+        stdin=b'\0'.join(raw_path for _, raw_path in relative_files) + b'\0',
+        catch_value_error=False,
+    )
+    if result is None or result.returncode not in (0, 1):
+        return files, git_failure_detail(result)
     ignored = frozenset(result.stdout.split(b'\0'))
-    return [path for path, raw_path in relative_files if raw_path not in ignored]
+    return [path for path, raw_path in relative_files if raw_path not in ignored], None
+
+
+def _included_nested_worktrees(
+    directory: Path,
+    nested_worktrees: list[Path],
+    failures: dict[Path, str],
+) -> set[Path]:
+    """Find nested worktrees retained by their parent's Git exclusions."""
+    included = {directory}
+    for root in nested_worktrees:
+        parent = next(
+            (
+                candidate
+                for candidate in reversed(nested_worktrees)
+                if candidate != root and root.is_relative_to(candidate)
+            ),
+            directory,
+        )
+        if parent in included:
+            retained, detail = _filter_git_ignored(parent, [root])
+            if detail is not None:
+                failures.setdefault(parent, detail)
+            if retained:
+                included.add(root)
+    return included
+
+
+def _inside_worktree(directory: Path) -> bool:
+    """Detect a Git marker in the directory or one of its parents."""
+    resolved = directory.resolve()
+    return any(
+        (root / '.git').is_dir() or (root / '.git').is_file()
+        for root in (resolved, *resolved.parents)
+    )
 
 
 def _collect_directory(directory: Path) -> list[Path]:
@@ -95,18 +125,8 @@ def _collect_directory(directory: Path) -> list[Path]:
         )
 
     by_worktree: dict[Path, list[Path]] = {directory: []}
-    included_worktrees = {directory}
-    for root in nested_worktrees:
-        parent = next(
-            (
-                candidate
-                for candidate in reversed(nested_worktrees)
-                if candidate != root and root.is_relative_to(candidate)
-            ),
-            directory,
-        )
-        if parent in included_worktrees and _filter_git_ignored(parent, [root]):
-            included_worktrees.add(root)
+    failures: dict[Path, str] = {}
+    included_worktrees = _included_nested_worktrees(directory, nested_worktrees, failures)
     for path in sorted(children):
         owner = next(
             (root for root in reversed(nested_worktrees) if path.is_relative_to(root)),
@@ -114,11 +134,20 @@ def _collect_directory(directory: Path) -> list[Path]:
         )
         if owner in included_worktrees:
             by_worktree.setdefault(owner, []).append(path)
-    return sorted(
-        path
-        for root, worktree_files in by_worktree.items()
-        for path in _filter_git_ignored(root, worktree_files)
-    )
+    retained_files: list[Path] = []
+    for root, worktree_files in by_worktree.items():
+        retained, detail = _filter_git_ignored(root, worktree_files)
+        if detail is not None:
+            failures.setdefault(root, detail)
+        retained_files.extend(retained)
+    for root, detail in failures.items():
+        if root != directory or _inside_worktree(directory):
+            warning = (
+                f'warning: cannot apply Git exclusions in {root}: {detail}; '
+                'keeping every discovered Python file'
+            )
+            print(visible_controls(warning), file=sys.stderr)
+    return sorted(retained_files)
 
 
 def collect_files(paths: list[str]) -> list[Path]:
@@ -218,29 +247,6 @@ def encode_with_newline(source: str, encoding: str, newline: Newline) -> bytes:
     return output.encode(encoding)
 
 
-def ensure_utf8_stdio() -> None:
-    """Reconfigure supported standard streams to UTF-8 on every platform.
-
-    Each standard stream exposing `reconfigure()` retains its existing error
-    handler.
-    """
-    if hasattr(sys.stdin, 'reconfigure'):
-        sys.stdin.reconfigure(  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            encoding='utf-8',
-            errors=sys.stdin.errors,
-        )
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            encoding='utf-8',
-            errors=sys.stdout.errors,
-        )
-    if hasattr(sys.stderr, 'reconfigure'):
-        sys.stderr.reconfigure(  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            encoding='utf-8',
-            errors=sys.stderr.errors,
-        )
-
-
 def read_file_result(path: Path) -> ReadResult:
     """Read one Python source snapshot with encoding metadata.
 
@@ -281,10 +287,9 @@ def write_preserving_newline(
     source: str,
     encoding: str,
     *,
-    raw: bytes | None = None,
-    fallback_newline: Newline = '\n',
+    raw: bytes,
 ) -> None:
-    """Write source using the input's selected newline or empty-file fallback.
+    """Write source using the input's newline style or LF for empty input.
 
     Nonempty input selects CRLF when any CRLF exists, otherwise LF.
 
@@ -292,13 +297,20 @@ def write_preserving_newline(
         path: Target file path.
         source: Transformed source text to write.
         encoding: File encoding (from tokenize detection).
-        raw: Pre-read raw bytes. If None, reads path to detect newline.
-        fallback_newline: Newline to use when raw is empty.
+        raw: Pre-read raw bytes used to detect the newline style.
 
     Raises:
-        OSError: If the existing path cannot be read or the new bytes cannot be
-            written.
+        OSError: If the new bytes cannot be written; the original bytes are
+            restored first when possible.
+        RestoreError: If the original bytes also cannot be restored.
     """
-    raw_bytes = path.read_bytes() if raw is None else raw
-    newline = detect_newline(raw_bytes) if raw_bytes else fallback_newline
-    path.write_bytes(encode_with_newline(source, encoding, newline))
+    newline = detect_newline(raw)
+    try:
+        path.write_bytes(encode_with_newline(source, encoding, newline))
+    except OSError as write_error:
+        try:
+            path.write_bytes(raw)
+        except OSError as restore_error:
+            message = f'{write_error}; restoring the original bytes also failed: {restore_error}'
+            raise RestoreError(write_error.errno, message) from write_error
+        raise

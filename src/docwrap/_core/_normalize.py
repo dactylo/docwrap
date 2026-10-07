@@ -14,7 +14,7 @@ TRIPLE_QUOTE_LEN = 3
 class LiteralInfo:
     """Parsed docstring literal components.
 
-    Args:
+    Attributes:
         prefix: String prefix (`r`, `u`, etc.).
         quote_char: Quote delimiter characters (triple).
         content: Raw source body between the delimiters, LF-normalized.

@@ -24,6 +24,7 @@ ENV/
 *.spec
 
 # Unit test / coverage reports
+.hypothesis/
 htmlcov/
 .tox/
 .nox/

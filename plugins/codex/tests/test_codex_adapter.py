@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 
-from docwrap._cli import _build_hook_parser
+from docwrap._hook_front import _build_hook_parser
 from docwrap._hosts import load_adapter
 from docwrap.hooks import API_VERSION, HookAdapter, HookResult, HostInput, HostResponse
 from plugins.codex._docwrap._adapter import CodexAdapter
@@ -70,6 +70,41 @@ class TestCodexAdapter:
         response = CodexAdapter().render(_result('deny', 'docwrap: reason'))
         assert json.loads(response.stdout) == DENY_JSON
         assert (response.stderr, response.exit_code) == ('docwrap: reason\n', 0)
+
+    @pytest.mark.parametrize(
+        ('reason', 'notes', 'context'),
+        [
+            (None, ('Cannot preserve layout.',), 'Cannot preserve layout.'),
+            ('Cannot wrap a.py: invalid syntax.', (), 'Cannot wrap a.py: invalid syntax.'),
+            ('first\nsecond', ('first', 'diagnostic'), 'first\ndiagnostic\nsecond'),
+        ],
+    )
+    def test_render_post_tool_context(
+        self, reason: str | None, notes: tuple[str, ...], context: str
+    ) -> None:
+        adapter = CodexAdapter()
+        payload = _payload('PostToolUse', 'apply_patch', {'command': '*** Update File: a.py\n'})
+        assert adapter.parse(payload, None)
+        response = adapter.render(_result('allow', reason, notes))
+        assert json.loads(response.stdout) == {
+            'hookSpecificOutput': {
+                'hookEventName': 'PostToolUse',
+                'additionalContext': context,
+            }
+        }
+        assert response.stderr == ''.join(f'{note}\n' for note in notes)
+        assert response.exit_code == 0
+
+    @pytest.mark.parametrize('event', ['PreToolUse', 'Notification', None])
+    def test_render_resets_post_tool_context(self, event: str | None) -> None:
+        adapter = CodexAdapter()
+        adapter.parse(_payload('PostToolUse', 'apply_patch', {}), None)
+        assert adapter.render(_result('allow')) == HostResponse('', '', 0)
+        adapter.parse({'hook_event_name': event}, None)
+        response = adapter.render(_result('deny', 'docwrap: reason'))
+        assert json.loads(response.stdout) == DENY_JSON
+        receipt = adapter.render(_result('allow', 'staged rewrite receipt'))
+        assert json.loads(receipt.stdout) == {'systemMessage': 'staged rewrite receipt'}
 
 
 @dataclass(frozen=True)

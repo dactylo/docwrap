@@ -93,9 +93,7 @@ class TestConversionIdempotency:
         first_report = wrap_source_report(source, config=config)
         second_report = wrap_source_report(first_report.source, config=config)
         reparsed = parse_docstrings(
-            first_report.source,
-            find_docstrings(first_report.source),
-            DocwrapConfig(),
+            first_report.source, find_docstrings(first_report.source), DocwrapConfig(), skips=[]
         )
         field_matches = [
             region.entry_match
@@ -230,7 +228,7 @@ class TestConversionIdempotency:
         compile(first.source, '<test>', 'exec')
 
         docstrings = find_docstrings(first.source)
-        reparsed = parse_docstrings(first.source, docstrings, config)
+        reparsed = parse_docstrings(first.source, docstrings, config, skips=[])
         assert len(reparsed) == 1
         assert [region for region in reparsed[0].regions if region.role == 'rtype'] == []
 
@@ -1414,7 +1412,7 @@ class TestGoogleMultiNameConversion:
             first = wrap_source_report(source, config=config)
             second = wrap_source_report(first.source, config=config)
 
-        reparsed = parse_docstrings(first.source, find_docstrings(first.source), config)
+        reparsed = parse_docstrings(first.source, find_docstrings(first.source), config, skips=[])
         param_matches = [
             region.entry_match
             for region in reparsed[0].regions
@@ -3014,15 +3012,7 @@ class TestStripTypesStandalone:
 class TestUnderlineBoundaryConversionProvenance:
     def test_deleted_text_is_exact_with_structural_underline(self) -> None:
         content = 'Summary.\n\n:param x: Kept.\n:type x: int\n\nBefore.\n----------\nAfter.'
-        norm, _ = normalize_content(content, source_margin='')
-        lines = norm.split('\n')
-        style = get_style('sphinx')
-        title_line_count = match_opening_title(lines, style) or 0
-        regions = parse_regions(
-            norm,
-            style=style,
-            code_block_lines=find_code_block_lines(lines, start=title_line_count),
-        )
+        regions = _regions_from(content, 'sphinx')
         deleted_text: list[str] = []
         converted = convert_regions(
             regions,
@@ -3153,9 +3143,7 @@ class TestUnsupportedSectionPreservation:
 
         first_report = wrap_source_report(source, config=config)
         reparsed = parse_docstrings(
-            first_report.source,
-            find_docstrings(first_report.source),
-            config,
+            first_report.source, find_docstrings(first_report.source), config, skips=[]
         )
         second_report = wrap_source_report(first_report.source, config=config)
 
@@ -3551,7 +3539,7 @@ class TestUnsupportedTargetRolePreservation:
         config = DocwrapConfig(convert='sphinx')
 
         report = wrap_source_report(source, config=config)
-        parsed = parse_docstrings(report.source, find_docstrings(report.source), config)
+        parsed = parse_docstrings(report.source, find_docstrings(report.source), config, skips=[])
         keyword_fields = [
             region
             for region in parsed[0].regions
@@ -4013,7 +4001,7 @@ def test_reflow_with_convert_idempotent(
     first = wrap_source(source, config=cfg)
     second = wrap_source(first, config=cfg)
     assert first == second
-    assert_region_projection(source, cfg)
+    assert_region_projection(source, cfg, emitted_source=first)
 
 
 def test_regions_from_uses_title_aware_code_scan() -> None:

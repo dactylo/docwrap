@@ -11,6 +11,7 @@ from docwrap._core._process import wrap_source, wrap_source_report
 from docwrap._core._wrap import (
     _effective_column,
     _fill,
+    _FillOptions,
     compute_quote_overhead,
     detect_summary_skip,
     wrap_regions,
@@ -99,7 +100,7 @@ class TestBodyMarkerBoundaries:
         assert first.wrapped == 1
         assert first.skips == second.skips == ()
         assert first.source == second.source
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first.source)
 
     @pytest.mark.parametrize('field', [':param x:', ':return:', ':raises ValueError:'])
     @pytest.mark.parametrize('fill_style', ['greedy', 'balanced', 'smart'])
@@ -121,13 +122,15 @@ class TestBodyMarkerBoundaries:
         assert first.skips == second.skips == ()
         assert f'    {field} ' in first.source
         assert first.source == second.source
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first.source)
 
     @pytest.mark.parametrize('fill_style', ['greedy', 'balanced', 'smart'])
     def test_inline_field_binding_preserves_gap(self, fill_style: FillStyle) -> None:
-        assert _fill('alpha beta  :param x: value', 12, fill_style=fill_style) == (
-            'alpha\nbeta  :param\nx: value'
-        )
+        assert _fill(
+            'alpha beta  :param x: value',
+            12,
+            options=_FillOptions(fill_style=fill_style, smart_slack=8),
+        ) == ('alpha\nbeta  :param\nx: value')
 
     @pytest.mark.parametrize('fill_style', ['greedy', 'balanced', 'smart'])
     @pytest.mark.parametrize('reflow', ['none', 'cautious', 'full'])
@@ -147,7 +150,7 @@ class TestBodyMarkerBoundaries:
         assert first.wrapped == 1
         assert first.skips == second.skips == ()
         assert first.source == second.source
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first.source)
 
     @pytest.mark.parametrize(
         ('word', 'expected'),
@@ -160,7 +163,11 @@ class TestBodyMarkerBoundaries:
     def test_ordinary_colon_word_can_start_a_line(
         self, word: str, expected: str, fill_style: FillStyle
     ) -> None:
-        result = _fill(f'alpha beta {word} value', 13, fill_style=fill_style)
+        result = _fill(
+            f'alpha beta {word} value',
+            13,
+            options=_FillOptions(fill_style=fill_style, smart_slack=8),
+        )
 
         assert result == expected
 
@@ -230,35 +237,75 @@ class TestFillStyle:
             '(2 parts). Yields (header, dest_path) pairs.'
         )
         monkeypatch.setattr(wrap_module, '_BALANCED_CANDIDATE_BUDGET', 1, raising=False)
-        expected = _fill(text, 75, initial='    ', fill_style='greedy')
+        expected = _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='greedy', smart_slack=8)
+        )
 
-        result = _fill(text, 75, initial='    ', fill_style='balanced')
+        result = _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='balanced', smart_slack=8)
+        )
 
         assert result == expected
-        assert _fill(result, 75, initial='    ', fill_style='balanced') == result
+        assert (
+            _fill(
+                result,
+                75,
+                initial='    ',
+                options=_FillOptions(fill_style='balanced', smart_slack=8),
+            )
+            == result
+        )
 
     def test_balanced_uses_minimum_line_count(self) -> None:
-        assert _fill('aaaa bbbb cccc dddd', 14, fill_style='balanced') == ('aaaa bbbb cccc\ndddd')
+        assert _fill(
+            'aaaa bbbb cccc dddd', 14, options=_FillOptions(fill_style='balanced', smart_slack=8)
+        ) == ('aaaa bbbb cccc\ndddd')
 
     def test_balanced_uses_weighted_raggedness_between_two_line_plans(self) -> None:
         text = (
             'Handles rename/copy advancement (3 null-separated parts) vs normal '
             '(2 parts). Yields (header, dest_path) pairs.'
         )
-        assert _fill(text, 75, initial='    ', fill_style='balanced') == (
+        assert _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='balanced', smart_slack=8)
+        ) == (
             '    Handles rename/copy advancement (3 null-separated parts) vs normal\n'
             '    (2 parts). Yields (header, dest_path) pairs.'
         )
 
     def test_empty_input_returns_empty_string(self) -> None:
-        assert _fill('', 20, initial='    ', fill_style='balanced') == ''
-        assert _fill('   ', 20, initial='    ', fill_style='balanced') == ''
-        assert _fill('', 20, initial='    ', fill_style='smart') == ''
-        assert _fill('   ', 20, initial='    ', fill_style='smart') == ''
+        assert (
+            _fill(
+                '', 20, initial='    ', options=_FillOptions(fill_style='balanced', smart_slack=8)
+            )
+            == ''
+        )
+        assert (
+            _fill(
+                '   ',
+                20,
+                initial='    ',
+                options=_FillOptions(fill_style='balanced', smart_slack=8),
+            )
+            == ''
+        )
+        assert (
+            _fill('', 20, initial='    ', options=_FillOptions(fill_style='smart', smart_slack=8))
+            == ''
+        )
+        assert (
+            _fill(
+                '   ', 20, initial='    ', options=_FillOptions(fill_style='smart', smart_slack=8)
+            )
+            == ''
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_expands_tabs_without_splitting_the_line(self, fill_style: FillStyle) -> None:
-        assert _fill('a\tb', 40, fill_style=fill_style) == 'a       b'
+        assert (
+            _fill('a\tb', 40, options=_FillOptions(fill_style=fill_style, smart_slack=8))
+            == 'a       b'
+        )
 
     @pytest.mark.parametrize(
         ('fill_style', 'smart_slack'),
@@ -273,8 +320,7 @@ class TestFillStyle:
             _fill(
                 '  alpha beta  ',
                 8,
-                fill_style=fill_style,
-                smart_slack=smart_slack,
+                options=_FillOptions(fill_style=fill_style, smart_slack=smart_slack),
             )
             == '  alpha\nbeta'
         )
@@ -284,7 +330,9 @@ class TestFillStyle:
             'Handles rename/copy advancement (3 null-separated parts) vs normal '
             '(2 parts). Yields (header, dest_path) pairs.'
         )
-        assert _fill(text, 75, initial='    ', fill_style='greedy') == (
+        assert _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='greedy', smart_slack=8)
+        ) == (
             '    Handles rename/copy advancement (3 null-separated parts) vs normal (2\n'
             '    parts). Yields (header, dest_path) pairs.'
         )
@@ -294,15 +342,20 @@ class TestFillStyle:
         self,
         fill_style: FillStyle,
     ) -> None:
-        assert _fill('alpha beta 1. gamma delta', 12, fill_style=fill_style) == (
-            'alpha\nbeta 1.\ngamma delta'
-        )
+        assert _fill(
+            'alpha beta 1. gamma delta',
+            12,
+            options=_FillOptions(fill_style=fill_style, smart_slack=8),
+        ) == ('alpha\nbeta 1.\ngamma delta')
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_long_single_word_is_not_split(self, fill_style: FillStyle) -> None:
-        assert _fill('supercalifragilistic', 8, initial='  ', fill_style=fill_style) == (
-            '  supercalifragilistic'
-        )
+        assert _fill(
+            'supercalifragilistic',
+            8,
+            initial='  ',
+            options=_FillOptions(fill_style=fill_style, smart_slack=8),
+        ) == ('  supercalifragilistic')
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_multispace_keeps_unbreakable_long_word(self, fill_style: FillStyle) -> None:
@@ -311,7 +364,7 @@ class TestFillStyle:
                 'supercalifragilistic  tail',
                 8,
                 initial='  ',
-                fill_style=fill_style,
+                options=_FillOptions(fill_style=fill_style, smart_slack=8),
             )
             == '  supercalifragilistic\n  tail'
         )
@@ -324,7 +377,7 @@ class TestFillStyle:
                 11,
                 initial='>>>> ',
                 subsequent='>',
-                fill_style=fill_style,
+                options=_FillOptions(fill_style=fill_style, smart_slack=8),
             )
             == '>>>> aa bbb\n>cccc'
         )
@@ -338,7 +391,7 @@ class TestFillStyle:
             _fill(
                 'aaaa  bbbb   cccc    dddd',
                 8,
-                fill_style=fill_style,
+                options=_FillOptions(fill_style=fill_style, smart_slack=8),
             )
             == 'aaaa\nbbbb\ncccc\ndddd'
         )
@@ -350,28 +403,42 @@ class TestFillStyle:
         fill_style: FillStyle,
         gap: str,
     ) -> None:
-        assert _fill(f'aaaa{gap}bbbb', 8, fill_style=fill_style) == 'aaaa\nbbbb'
+        assert (
+            _fill(f'aaaa{gap}bbbb', 8, options=_FillOptions(fill_style=fill_style, smart_slack=8))
+            == 'aaaa\nbbbb'
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_multispace_selected_gap_reunites_as_one_space(self, fill_style: FillStyle) -> None:
-        assert _fill('aa  bbb c', 6, fill_style=fill_style) == 'aa bbb\nc'
+        assert (
+            _fill('aa  bbb c', 6, options=_FillOptions(fill_style=fill_style, smart_slack=8))
+            == 'aa bbb\nc'
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_multispace_unselected_gap_remains_exact(self, fill_style: FillStyle) -> None:
-        assert _fill('aa  bb ccccc', 7, fill_style=fill_style) == 'aa  bb\nccccc'
+        assert (
+            _fill('aa  bb ccccc', 7, options=_FillOptions(fill_style=fill_style, smart_slack=8))
+            == 'aa  bb\nccccc'
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_non_structural_word_retains_ordinary_fill(
         self,
         fill_style: FillStyle,
     ) -> None:
-        assert _fill('alpha beta gamma ^^^^', 12, fill_style=fill_style) == (
-            'alpha beta\ngamma ^^^^'
-        )
+        assert _fill(
+            'alpha beta gamma ^^^^', 12, options=_FillOptions(fill_style=fill_style, smart_slack=8)
+        ) == ('alpha beta\ngamma ^^^^')
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_preserves_interior_double_spaces(self, fill_style: FillStyle) -> None:
-        assert _fill('hello  world  foo', 40, fill_style=fill_style) == 'hello  world  foo'
+        assert (
+            _fill(
+                'hello  world  foo', 40, options=_FillOptions(fill_style=fill_style, smart_slack=8)
+            )
+            == 'hello  world  foo'
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_respects_different_indent_widths(self, fill_style: FillStyle) -> None:
@@ -381,7 +448,7 @@ class TestFillStyle:
                 12,
                 initial='>>>> ',
                 subsequent='>',
-                fill_style=fill_style,
+                options=_FillOptions(fill_style=fill_style, smart_slack=8),
             )
             == '>>>> alpha\n>beta gamma\n>delta'
         )
@@ -396,21 +463,30 @@ class TestFillStyle:
 
         monkeypatch.setattr(wrap_module, '_stabilize_fill_plan', fail_planner)
 
-        result = _fill(text, width, initial='    ', fill_style='balanced')
+        result = _fill(
+            text, width, initial='    ', options=_FillOptions(fill_style='balanced', smart_slack=8)
+        )
 
         assert result == '    ' + text
 
     def test_smart_default_repairs_medium_parenthesized_fragment(self) -> None:
         text = 'aaaa bbbb (e.g. parts) tail'
-        assert _fill(text, 18, fill_style='smart') == 'aaaa bbbb\n(e.g. parts) tail'
+        assert (
+            _fill(text, 18, options=_FillOptions(fill_style='smart', smart_slack=8))
+            == 'aaaa bbbb\n(e.g. parts) tail'
+        )
 
     def test_smart_does_not_back_off_to_empty_line(self) -> None:
         text = '(2 parts). remaining words'
-        assert _fill(text, 3, fill_style='smart') == _fill(text, 3, fill_style='greedy')
+        assert _fill(text, 3, options=_FillOptions(fill_style='smart', smart_slack=8)) == _fill(
+            text, 3, options=_FillOptions(fill_style='greedy', smart_slack=8)
+        )
 
     def test_smart_does_not_move_ordinary_word(self) -> None:
         text = 'Resolved config, or plain defaults if the config file has an unrecognized style.'
-        assert _fill(text, 79, initial='        ', fill_style='smart') == (
+        assert _fill(
+            text, 79, initial='        ', options=_FillOptions(fill_style='smart', smart_slack=8)
+        ) == (
             '        Resolved config, or plain defaults if the config file has an\n'
             '        unrecognized style.'
         )
@@ -420,7 +496,9 @@ class TestFillStyle:
             'Handles rename/copy advancement (3 null-separated parts) vs normal '
             '[2 parts]. Yields (header, dest_path) pairs.'
         )
-        result = _fill(text, 75, initial='    ', fill_style='smart')
+        result = _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='smart', smart_slack=8)
+        )
         lines = result.splitlines()
         assert lines[0].endswith('normal')
         assert lines[1].lstrip().startswith('[2 parts].')
@@ -430,44 +508,58 @@ class TestFillStyle:
             'Handles rename/copy advancement (3 null-separated parts) vs normal '
             '(2 parts). Yields (header, dest_path) pairs.'
         )
-        result = _fill(text, 75, initial='    ', fill_style='smart')
+        result = _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='smart', smart_slack=8)
+        )
         lines = result.splitlines()
         assert lines[0].endswith('normal')
         assert lines[1].lstrip().startswith('(2 parts).')
 
     def test_smart_narrow_width_backoff_may_increase_lines(self) -> None:
         text = 'xxxx (2 parts) yy'
-        greedy = _fill(text, 10, fill_style='greedy')
-        smart = _fill(text, 10, fill_style='smart')
+        greedy = _fill(text, 10, options=_FillOptions(fill_style='greedy', smart_slack=8))
+        smart = _fill(text, 10, options=_FillOptions(fill_style='smart', smart_slack=8))
         # Smart may produce more lines than greedy; this is expected
         # for narrow widths -- local repair, not global optimization.
         assert smart.count('\n') >= greedy.count('\n')
 
     def test_smart_nested_opener_does_not_false_positive_backoff(self) -> None:
         text = 'aaaa bbbb (x(y z) tail'
-        result = _fill(text, 16, fill_style='smart', smart_slack=5)
-        greedy = _fill(text, 16, fill_style='greedy')
+        result = _fill(text, 16, options=_FillOptions(fill_style='smart', smart_slack=5))
+        greedy = _fill(text, 16, options=_FillOptions(fill_style='greedy', smart_slack=8))
         assert result == greedy
 
     def test_smart_rejects_backoff_over_slack_budget(self) -> None:
         text = 'aaaa bbbb (12345678 parts) x'
-        assert _fill(text, 19, fill_style='smart') == 'aaaa bbbb (12345678\nparts) x'
+        assert (
+            _fill(text, 19, options=_FillOptions(fill_style='smart', smart_slack=8))
+            == 'aaaa bbbb (12345678\nparts) x'
+        )
 
     def test_smart_rejects_backoff_that_exposes_previous_line_repair(self) -> None:
         text = 'aaaa (x (zz qq) y)'
-        assert _fill(text, 12, fill_style='smart') == _fill(text, 12, fill_style='greedy')
+        assert _fill(text, 12, options=_FillOptions(fill_style='smart', smart_slack=8)) == _fill(
+            text, 12, options=_FillOptions(fill_style='greedy', smart_slack=8)
+        )
 
     def test_smart_rejects_backoff_that_pushes_content_later(self) -> None:
         text = 'aaaa bbbb (x y) c d e f g'
-        assert _fill(text, 12, fill_style='smart') == _fill(text, 12, fill_style='greedy')
+        assert _fill(text, 12, options=_FillOptions(fill_style='smart', smart_slack=8)) == _fill(
+            text, 12, options=_FillOptions(fill_style='greedy', smart_slack=8)
+        )
 
     def test_smart_rejects_backoff_that_would_skip_next_repair(self) -> None:
         text = 'aaaa bbbb (x y) cc (zz qq)'
-        assert _fill(text, 12, fill_style='smart') == 'aaaa bbbb (x\ny) cc\n(zz qq)'
+        assert (
+            _fill(text, 12, options=_FillOptions(fill_style='smart', smart_slack=8))
+            == 'aaaa bbbb (x\ny) cc\n(zz qq)'
+        )
 
     def test_smart_rejects_backoff_when_delimiter_group_would_still_wrap(self) -> None:
         text = 'aaaa bbbb (x m n yyyyyyyyyy)'
-        assert _fill(text, 12, fill_style='smart') == _fill(text, 12, fill_style='greedy')
+        assert _fill(text, 12, options=_FillOptions(fill_style='smart', smart_slack=8)) == _fill(
+            text, 12, options=_FillOptions(fill_style='greedy', smart_slack=8)
+        )
 
     def test_smart_slack_propagates_through_wrap_source(self) -> None:
         source = (
@@ -487,14 +579,16 @@ class TestFillStyle:
             'Handles rename/copy advancement (3 null-separated parts) vs normal '
             '(2 parts). Yields (header, dest_path) pairs.'
         )
-        assert _fill(text, 75, initial='    ', fill_style='smart', smart_slack=0) == _fill(
-            text, 75, initial='    ', fill_style='greedy'
+        assert _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='smart', smart_slack=0)
+        ) == _fill(
+            text, 75, initial='    ', options=_FillOptions(fill_style='greedy', smart_slack=8)
         )
 
     def test_smart_unrelated_closer_does_not_trigger_backoff(self) -> None:
         text = 'aaaa bbbb cccc (x ddd (done) eeee'
-        result = _fill(text, 20, fill_style='smart')
-        greedy = _fill(text, 20, fill_style='greedy')
+        result = _fill(text, 20, options=_FillOptions(fill_style='smart', smart_slack=8))
+        greedy = _fill(text, 20, options=_FillOptions(fill_style='greedy', smart_slack=8))
         # Greedy puts '(x' at line end.  Subsequent words include
         # '(done)' whose ')' belongs to a different group.
         # Smart should NOT back off -- '(x' has no matching closer.
@@ -509,7 +603,7 @@ class TestFillStyle:
     ) -> None:
         text = f'alpha beta gamma {adornment} delta'
 
-        result = _fill(text, 16, fill_style=fill_style)
+        result = _fill(text, 16, options=_FillOptions(fill_style=fill_style, smart_slack=8))
 
         assert all(not line.startswith(adornment) for line in result.splitlines())
         assert result.split() == text.split()
@@ -523,7 +617,7 @@ class TestFillStyle:
     ) -> None:
         text = f'alpha beta gamma {adornment}'
 
-        result = _fill(text, 16, fill_style=fill_style)
+        result = _fill(text, 16, options=_FillOptions(fill_style=fill_style, smart_slack=8))
 
         assert all(not line.startswith(adornment) for line in result.splitlines())
         assert result.split() == text.split()
@@ -533,7 +627,10 @@ class TestFillStyle:
         self,
         fill_style: FillStyle,
     ) -> None:
-        assert _fill('alpha beta 1.', 10, fill_style=fill_style) == 'alpha\nbeta 1.'
+        assert (
+            _fill('alpha beta 1.', 10, options=_FillOptions(fill_style=fill_style, smart_slack=8))
+            == 'alpha\nbeta 1.'
+        )
 
     @pytest.mark.parametrize('fill_style', ['balanced', 'greedy', 'smart'])
     def test_terminal_marker_wrap_is_idempotent(self, fill_style: FillStyle) -> None:
@@ -550,8 +647,24 @@ class TestFillStyle:
         assert wrap_source(first, config=config) == first
 
     def test_text_fitting_one_line_is_not_wrapped(self) -> None:
-        assert _fill('short line', 40, initial='  ', fill_style='balanced') == '  short line'
-        assert _fill('short line', 40, initial='  ', fill_style='smart') == '  short line'
+        assert (
+            _fill(
+                'short line',
+                40,
+                initial='  ',
+                options=_FillOptions(fill_style='balanced', smart_slack=8),
+            )
+            == '  short line'
+        )
+        assert (
+            _fill(
+                'short line',
+                40,
+                initial='  ',
+                options=_FillOptions(fill_style='smart', smart_slack=8),
+            )
+            == '  short line'
+        )
 
     def test_zero_or_negative_capacity_places_one_word_per_line(self) -> None:
         assert (
@@ -560,7 +673,7 @@ class TestFillStyle:
                 2,
                 initial='>>>>',
                 subsequent='>>>',
-                fill_style='balanced',
+                options=_FillOptions(fill_style='balanced', smart_slack=8),
             )
             == '>>>>one\n>>>two\n>>>three'
         )
@@ -1710,7 +1823,7 @@ class TestSummaryMarkerBoundaries:
             self._source(marker, position, adjacent_text),
             config=config,
         )
-        reparsed = parse_docstrings(first, find_docstrings(first), config)[0]
+        reparsed = parse_docstrings(first, find_docstrings(first), config, skips=[])[0]
         summary = reparsed.regions[0]
         assert summary.source_start is not None
         summary_lines = reparsed.content.splitlines()[
@@ -1756,7 +1869,7 @@ class TestSummaryMarkerBoundaries:
             self._source('+', 'beginning', adjacent_text),
             config=config,
         )
-        reparsed = parse_docstrings(first, find_docstrings(first), config)[0]
+        reparsed = parse_docstrings(first, find_docstrings(first), config, skips=[])[0]
         summary = reparsed.regions[0]
         assert summary.source_start is not None
         summary_lines = reparsed.content.splitlines()[
@@ -2304,7 +2417,7 @@ class TestSummarySkipDetection:
             summary_start=summary_start,
             wrap_summary=False,
         )
-        parsed = parse_docstrings(source, find_docstrings(source), config)
+        parsed = parse_docstrings(source, find_docstrings(source), config, skips=[])
 
         assert len(parsed) == 1
         assert parsed[0].base_indent == expected_base_indent
@@ -2382,7 +2495,7 @@ def test_compute_quote_overhead_first_line() -> None:
     source = 'def foo():\n    """Hello."""\n'
     cfg = DocwrapConfig(line_length=79, summary_start='first-line')
     docs = find_docstrings(source)
-    parsed = parse_docstrings(source, docs, cfg)[0]
+    parsed = parse_docstrings(source, docs, cfg, skips=[])[0]
     overhead = compute_quote_overhead(parsed, cfg)
     assert overhead == len(parsed.lit.prefix) + 3  # prefix + """
 
@@ -2391,7 +2504,7 @@ def test_compute_quote_overhead_second_line() -> None:
     source = 'def foo():\n    """Hello."""\n'
     cfg = DocwrapConfig(line_length=79, summary_start='second-line')
     docs = find_docstrings(source)
-    parsed = parse_docstrings(source, docs, cfg)[0]
+    parsed = parse_docstrings(source, docs, cfg, skips=[])[0]
     overhead = compute_quote_overhead(parsed, cfg)
     assert overhead == 0
 

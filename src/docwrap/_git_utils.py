@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 _GIT_C_STYLE_ESCAPES = {
@@ -74,3 +75,59 @@ def git_executable() -> str | None:
         if executable is not None:
             return executable
     return None
+
+
+def git_failure_detail(result: subprocess.CompletedProcess[bytes] | None) -> str:
+    """Describe why a Git command could not provide a usable result.
+
+    Args:
+        result: Failed Git command, or `None` when Git could not be run.
+
+    Returns:
+        The first nonblank stderr line, or a stable fallback when stderr is
+        empty or Git could not be run.
+    """
+    if result is None:
+        return 'git could not be run'
+    for line in result.stderr.decode(errors='replace').splitlines():
+        if detail := line.strip():
+            return detail
+    return f'git exited with status {result.returncode}'
+
+
+def run_git_command_bytes(
+    args: list[str | bytes],
+    cwd: str | Path,
+    *,
+    stdin: bytes | None = None,
+    catch_value_error: bool = True,
+) -> subprocess.CompletedProcess[bytes] | None:
+    """Run a binary-mode Git command with standard capture settings.
+
+    Args:
+        args: Git command and arguments.
+        cwd: Directory in which to run the command.
+        stdin: Optional bytes to send to Git.
+        catch_value_error: Whether invalid subprocess arguments return `None`.
+
+    Returns:
+        Completed command, or `None` when Git is unavailable or launching
+        fails.
+    """
+    try:
+        executable = git_executable()
+        if executable is None:
+            return None
+        return subprocess.run(  # noqa: S603
+            [executable, *args[1:]],
+            input=stdin,
+            capture_output=True,
+            cwd=cwd,
+            check=False,
+        )
+    except OSError:
+        return None
+    except ValueError:
+        if catch_value_error:
+            return None
+        raise

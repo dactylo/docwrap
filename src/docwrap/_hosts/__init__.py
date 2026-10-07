@@ -11,7 +11,7 @@ class AdapterLoadError(Exception):
     """Report that no functioning adapter exists for the selected host."""
 
 
-def _registered_hosts() -> list[str]:
+def registered_host_names() -> list[str]:
     """Return sorted names of registered hook adapters."""
     return sorted({entry.name for entry in entry_points(group=_ENTRY_POINT_GROUP)})
 
@@ -32,7 +32,7 @@ def load_adapter(name: str) -> HookAdapter:
     """
     matches = [entry for entry in entry_points(group=_ENTRY_POINT_GROUP) if entry.name == name]
     if not matches:
-        hosts = ', '.join(_registered_hosts()) or 'none'
+        hosts = ', '.join(registered_host_names()) or 'none'
         raise AdapterLoadError(f"unknown host '{name}'; registered hosts: {hosts}")
     if len(matches) > 1:
         raise AdapterLoadError(f"host '{name}' is registered {len(matches)} times")

@@ -1,7 +1,7 @@
 """Discover and parse docstrings from Python syntax trees."""
 
 import ast
-import logging
+import warnings
 from dataclasses import dataclass
 
 from docwrap._core._codeblock import find_code_block_lines
@@ -26,9 +26,8 @@ from docwrap._detect import detect_style
 from docwrap._styles import Style, get_style, resolve_style_override
 from docwrap._types import DocstringSkip, DocwrapConfig, StyleName, SummaryStart
 
-MODULE_QUALNAME = '<module>'
+_MODULE_QUALNAME = '<module>'
 _UNDERLINE_TITLE_LINE_COUNT = 2
-_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +38,7 @@ class DocstringInfo:
     underlying literal coordinates for parenthesized docstrings. Literal
     slicing uses the coordinates on `info.node.value`.
 
-    Args:
+    Attributes:
         node: AST expression containing the docstring literal.
         lineno: First source line of the literal.
         end_lineno: Final source line of the literal.
@@ -67,7 +66,7 @@ class DocstringInfo:
 class ParsedDocstring:
     """Pre-parsed docstring data ready for wrapping.
 
-    Args:
+    Attributes:
         info: Discovery metadata from AST traversal.
         lit: Parsed literal components (prefix, quote char, content).
         regions: Typed regions parsed from the normalized content.
@@ -145,32 +144,26 @@ def _literal_source_context(
 def _record_unmappable_literal(
     info: DocstringInfo,
     is_triple: bool,
-    skips: list[DocstringSkip] | None,
+    skips: list[DocstringSkip],
 ) -> None:
-    """Record or log an unmappable triple-quoted literal."""
+    """Record an unmappable triple-quoted literal."""
     if not is_triple:
         return
-    if skips is not None:
-        skips.append(
-            DocstringSkip(
-                path='',
-                line=info.lineno,
-                qualname=info.qualname,
-                code='implicit-concatenation',
-                message='implicitly concatenated docstring literal',
-            )
+    skips.append(
+        DocstringSkip(
+            path='',
+            line=info.lineno,
+            qualname=info.qualname,
+            code='implicit-concatenation',
+            message='implicitly concatenated docstring literal',
         )
-        return
-    _logger.warning(
-        'line %d: could not map docstring literal, skipping',
-        info.lineno,
     )
 
 
 def _shield_literal_content(
     lit: LiteralInfo,
     info: DocstringInfo,
-    skips: list[DocstringSkip] | None,
+    skips: list[DocstringSkip],
 ) -> tuple[str, tuple[tuple[str, str], ...]] | None:
     """Shield a non-raw literal body, or return None when scanning fails."""
     work_body = lit.content
@@ -180,16 +173,15 @@ def _shield_literal_content(
     try:
         shielded = shield_escapes(work_body)
     except EscapeScanError as error:
-        if skips is not None:
-            skips.append(
-                DocstringSkip(
-                    path='',
-                    line=info.lineno,
-                    qualname=info.qualname,
-                    code=error.code,
-                    message=str(error),
-                )
+        skips.append(
+            DocstringSkip(
+                path='',
+                line=info.lineno,
+                qualname=info.qualname,
+                code=error.code,
+                message=str(error),
             )
+        )
         return None
     return shielded.text, shielded.escape_map
 
@@ -264,64 +256,18 @@ def definition_key(
     return (start, node.end_lineno or node.lineno)
 
 
-def find_docstrings(source: str) -> list[DocstringInfo]:
-    """Find all docstrings in Python source via AST.
-
-    Args:
-        source: Python source code string.
-
-    Returns:
-        List of DocstringInfo sorted by (lineno, col_offset).
-
-    Raises:
-        SyntaxError: If the source cannot be parsed.
-    """
-    tree = ast.parse(source)
-    stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
-    results: list[DocstringInfo] = []
-
-    while stack:
-        node, parts = stack.pop()
-
-        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
-            if isinstance(node, ast.Module):
-                next_parts = parts
-                qualname = MODULE_QUALNAME
-            else:
-                next_parts = (*parts, node.name)
-                qualname = '.'.join(next_parts)
-
-            if (
-                node.body
-                and isinstance(first := node.body[0], ast.Expr)
-                and isinstance(first.value, ast.Constant)
-                and isinstance(first.value.value, str)
-            ):
-                d_lineno, d_end_lineno = definition_key(node)
-                results.append(
-                    DocstringInfo(
-                        node=first,
-                        lineno=first.value.lineno,
-                        end_lineno=first.value.end_lineno or first.value.lineno,
-                        col_offset=first.col_offset,
-                        end_col_offset=first.end_col_offset or 0,
-                        def_end_lineno=d_end_lineno,
-                        def_lineno=d_lineno,
-                        qualname=qualname,
-                    )
-                )
-
-        else:
-            next_parts = parts
-
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.stmt):
-                stack.append((child, next_parts))
-            elif isinstance(child, ast.ExceptHandler | ast.match_case):
-                stack.extend((statement, next_parts) for statement in child.body)
-
-    results.sort(key=lambda d: (d.lineno, d.col_offset))
-    return results
+def docstring_expression(
+    node: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> ast.Expr | None:
+    """Return the leading string expression of a docstring-owning scope, if any."""
+    if (
+        node.body
+        and isinstance(first := node.body[0], ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return first
+    return None
 
 
 def parse_docstrings(
@@ -330,7 +276,7 @@ def parse_docstrings(
     config: DocwrapConfig,
     source_lines: list[str] | None = None,
     *,
-    skips: list[DocstringSkip] | None = None,
+    skips: list[DocstringSkip],
 ) -> list[ParsedDocstring]:
     """Parse discovered docstrings into structured representations.
 
@@ -346,9 +292,9 @@ def parse_docstrings(
             terminators, as returned by `split_source_lines`. If `None`, splits
             source internally. Pass this to avoid redundant splitting when the
             caller already has the lines.
-        skips: Optional accumulator; receives `DocstringSkip` records with an
-            empty path for escape-safety skips and unmappable implicitly
-            concatenated triple-quoted literals.
+        skips: Accumulator for `DocstringSkip` records with an empty path for
+            escape-safety skips and unmappable implicitly concatenated
+            triple-quoted literals.
 
     Returns:
         List of `ParsedDocstring` for each processable triple-quoted docstring.
@@ -390,7 +336,7 @@ def parse_docstrings(
             middle = source_lines[raw_lineno : raw_end_lineno - 1]
             raw_literal = ''.join([first_part, *middle, last_part])
 
-        # Distinguish single-quoted (skip silently) from unmappable (warn)
+        # Distinguish single-quoted literals from unmappable triples.
         m = PREFIX_RE.match(raw_literal)
         is_triple = m is not None and len(m.group(2)) == TRIPLE_QUOTE_LEN
 
@@ -398,7 +344,7 @@ def parse_docstrings(
             continue
         lit = parse_literal(raw_literal)
         if lit is None:
-            # Warn for triple-quoted strings only (single-quoted skip silently)
+            # Record unmappable triples; skip single-quoted strings silently.
             _record_unmappable_literal(info, is_triple, skips)
             continue
 
@@ -463,4 +409,77 @@ def parse_docstrings(
             )
         )
 
+    return results
+
+
+def parse_source(source: str | bytes) -> ast.Module:
+    """Parse source without emitting compiler warnings about user code.
+
+    Args:
+        source: Python source text or bytes with their original encoding
+            cookie.
+
+    Returns:
+        Parsed module tree.
+
+    Raises:
+        SyntaxError: If the source is invalid independently of warning filters.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        return ast.parse(source)
+
+
+def find_docstrings(source: str) -> list[DocstringInfo]:
+    """Find all docstrings in Python source via AST.
+
+    Args:
+        source: Python source code string.
+
+    Returns:
+        List of DocstringInfo sorted by (lineno, col_offset).
+
+    Raises:
+        SyntaxError: If the source cannot be parsed.
+    """
+    tree = parse_source(source)
+    stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
+    results: list[DocstringInfo] = []
+
+    while stack:
+        node, parts = stack.pop()
+
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            if isinstance(node, ast.Module):
+                next_parts = parts
+                qualname = _MODULE_QUALNAME
+            else:
+                next_parts = (*parts, node.name)
+                qualname = '.'.join(next_parts)
+
+            if (first := docstring_expression(node)) is not None:
+                d_lineno, d_end_lineno = definition_key(node)
+                results.append(
+                    DocstringInfo(
+                        node=first,
+                        lineno=first.value.lineno,
+                        end_lineno=first.value.end_lineno or first.value.lineno,
+                        col_offset=first.col_offset,
+                        end_col_offset=first.end_col_offset or 0,
+                        def_end_lineno=d_end_lineno,
+                        def_lineno=d_lineno,
+                        qualname=qualname,
+                    )
+                )
+
+        else:
+            next_parts = parts
+
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.stmt):
+                stack.append((child, next_parts))
+            elif isinstance(child, ast.ExceptHandler | ast.match_case):
+                stack.extend((statement, next_parts) for statement in child.body)
+
+    results.sort(key=lambda d: (d.lineno, d.col_offset))
     return results

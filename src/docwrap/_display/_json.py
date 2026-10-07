@@ -9,18 +9,8 @@ if TYPE_CHECKING:
     from docwrap._types import WrapReport
 
 
-class JsonChange(TypedDict):
-    """JSON record for a changed docstring.
-
-    Args:
-        qualname: Qualified name of the docstring owner.
-        start_line: First source line of the docstring.
-        end_line: Final source line of the docstring.
-        before: Original docstring text at diff detail, otherwise `None`.
-        after: Wrapped docstring text at diff detail, otherwise `None`.
-        summary_skipped: Whether summary wrapping was skipped.
-        summary_width: Width of the skipped summary, or `None`.
-    """
+class _JsonChange(TypedDict):
+    """Describe one changed docstring in JSON output."""
 
     qualname: str
     start_line: int
@@ -31,15 +21,8 @@ class JsonChange(TypedDict):
     summary_width: int | None
 
 
-class JsonSkip(TypedDict):
-    """JSON record for a skipped docstring.
-
-    Args:
-        line: Source line of the skipped docstring.
-        qualname: Qualified name of the docstring owner.
-        code: Machine-readable skip reason.
-        message: Human-readable skip explanation.
-    """
+class _JsonSkip(TypedDict):
+    """Describe one skipped docstring in JSON output."""
 
     line: int
     qualname: str
@@ -58,7 +41,7 @@ class _JsonCounts(TypedDict):
 class JsonFileRecord(TypedDict):
     """JSON version 1 record for one file.
 
-    Args:
+    Attributes:
         path: Display path of the processed file.
         status: Processing outcome.
         warning: Failure diagnostic, or `None`.
@@ -75,8 +58,8 @@ class JsonFileRecord(TypedDict):
     style: StyleName | None
     line_length: int | None
     docstrings: _JsonCounts
-    skips: list[JsonSkip]
-    changes: list[JsonChange]
+    skips: list[_JsonSkip]
+    changes: list[_JsonChange]
 
 
 def format_json(records: list[JsonFileRecord]) -> str:
@@ -129,7 +112,7 @@ def json_success_record(
     Returns:
         A file record preserving the JSON version 1 field order.
     """
-    changes: list[JsonChange] = [
+    changes: list[_JsonChange] = [
         {
             'qualname': dc.qualname,
             'start_line': dc.start_line,
@@ -142,7 +125,7 @@ def json_success_record(
         for dc in report.docstrings
         if dc.changed
     ]
-    skips: list[JsonSkip] = [
+    skips: list[_JsonSkip] = [
         {
             'line': skip.line,
             'qualname': skip.qualname,

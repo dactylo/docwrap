@@ -2,38 +2,13 @@
 
 import contextlib
 import errno
+import io
 import os
 import sys
 from collections.abc import Generator, Iterable
 from typing import TextIO, cast
 
 _WINDOWS = sys.platform == 'win32'
-
-
-def _null_text_stream() -> TextIO:
-    """Open a text stream on the null device."""
-    sink = os.open(os.devnull, os.O_WRONLY)
-    try:
-        return os.fdopen(sink, 'w', encoding='utf-8')
-    except BaseException:
-        os.close(sink)
-        raise
-
-
-def is_downstream_closure(error: OSError, *, windows: bool | None = None) -> bool:
-    """Report whether a write or flush failed because the reader closed the stream.
-
-    Args:
-        error: Error raised by a write or flush of an output stream.
-        windows: Whether Windows error reporting applies, or `None` for the
-            running platform. CPython on Windows can report a write to a pipe
-            whose reader closed as `EINVAL`.
-
-    Returns:
-        Whether the error means the downstream reader is gone.
-    """
-    on_windows = _WINDOWS if windows is None else windows
-    return isinstance(error, BrokenPipeError) or (on_windows and error.errno == errno.EINVAL)
 
 
 class ClosableTextOutput:
@@ -43,17 +18,14 @@ class ClosableTextOutput:
     encoding, terminal detection, and reconfiguration behave as on that stream.
     """
 
-    def __init__(self, stream: TextIO, *, windows: bool | None = None) -> None:
+    def __init__(self, stream: TextIO) -> None:
         """Wrap a text stream.
 
         Args:
             stream: Stream written through until its reader closes.
-            windows: Whether Windows closed-pipe reporting applies, or `None`
-                for the running platform.
         """
         self._closed_downstream = False
         self._stream = stream
-        self._windows = windows
 
     def __getattr__(self, name: str) -> object:
         """Return an attribute of the wrapped stream."""
@@ -75,7 +47,7 @@ class ClosableTextOutput:
         try:
             self._stream.flush()
         except OSError as error:
-            if not is_downstream_closure(error, windows=self._windows):
+            if not _is_downstream_closure(error):
                 raise
             self._closed_downstream = True
 
@@ -96,7 +68,7 @@ class ClosableTextOutput:
         try:
             return self._stream.write(text)
         except OSError as error:
-            if not is_downstream_closure(error, windows=self._windows):
+            if not _is_downstream_closure(error):
                 raise
             self._closed_downstream = True
             return len(text)
@@ -118,28 +90,22 @@ class ClosableTextOutput:
                 return
 
 
-def silence_descriptor(stream: TextIO) -> bool:
-    """Point a stream's descriptor at the null device when it has one.
+def _is_downstream_closure(error: OSError) -> bool:
+    """Report whether a write or flush failed because the reader closed the stream."""
+    return isinstance(error, BrokenPipeError) or (_WINDOWS and error.errno == errno.EINVAL)
 
-    Args:
-        stream: Stream whose descriptor the interpreter flushes at shutdown.
 
-    Returns:
-        Whether the stream had a descriptor to redirect.
-
-    Raises:
-        OSError: If redirecting an existing descriptor fails.
-    """
+def _silence_descriptor(stream: TextIO) -> None:
+    """Point a stream's descriptor at the null device when it has one."""
     try:
         target = stream.fileno()
     except (OSError, ValueError):
-        return False
+        return
     devnull = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull, target)
     finally:
         os.close(devnull)
-    return True
 
 
 @contextlib.contextmanager
@@ -148,9 +114,10 @@ def closable_stdout() -> Generator[ClosableTextOutput]:
 
     On every exit, including `SystemExit` from argument parsing, pending output
     is flushed through the wrapper and the original stream is restored. If the
-    reader closed, the original descriptor is pointed at the null device, or a
-    stream without a descriptor is replaced by a null-device stream, so the
-    interpreter's final flush cannot fail again.
+    reader closed, the original descriptor is pointed at the null device so the
+    interpreter's final flush cannot fail again. The closure latch remains
+    because display functions write from many places, and the documented exit
+    status reflects the work completed when the reader closes.
 
     Yields:
         The installed wrapper.
@@ -165,10 +132,20 @@ def closable_stdout() -> Generator[ClosableTextOutput]:
             output.flush()
         finally:
             sys.stdout = original
-            if output.closed_downstream and not silence_descriptor(original):
-                # The interpreter still flushes a stream without a descriptor
-                # at shutdown, so replace it with one that cannot fail.
-                sys.stdout = _null_text_stream()
+            if output.closed_downstream:
+                _silence_descriptor(original)
+
+
+def ensure_utf8_stdio() -> None:
+    """Reconfigure supported standard streams to UTF-8 on every platform.
+
+    Each text stream retains its existing error handler.
+    """
+    # Transitional: PEP 686 makes UTF-8 mode the default in Python 3.15. Remove this
+    # function when requires-python is >=3.15; PYTHONUTF8=0 then remains a deliberate opt-out.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding='utf-8', errors=stream.errors)
 
 
 def stdout_closed() -> bool:

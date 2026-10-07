@@ -4,8 +4,9 @@ from unittest.mock import Mock
 
 import pytest
 
+import docwrap._hook_front as front_mod
 from docwrap import _hook as hook_mod
-from docwrap._hook import run_hook
+from docwrap._hook_front import run_hook
 
 
 def _payload(command: str, cwd: Path) -> str:
@@ -97,7 +98,7 @@ def test_classifier_exception_always_denies(
     def repository_work_forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail('failed classification reached repository work')
 
-    monkeypatch.setattr(hook_mod, 'classify_command', classification_failed)
+    monkeypatch.setattr(front_mod, 'classify_command', classification_failed)
     for name in ('is_hook_enabled', 'discover_repo_root', 'run_pre_commit_adds'):
         monkeypatch.setattr(hook_mod, name, repository_work_forbidden)
     result = run_hook(

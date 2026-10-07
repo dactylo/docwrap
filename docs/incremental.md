@@ -58,11 +58,11 @@ every context.
 
 ### CLI flags
 
-| Flag                  | Short | Description                                        |
-| --------------------- | ----- | -------------------------------------------------- |
-| `--incremental`       | `-i`  | Enable incremental mode                            |
-| `--incremental-level` |       | Override level (`file`, `definition`, `docstring`) |
-| `--no-incremental`    |       | Explicitly disable incremental mode                |
+| Flag                  | Short | Description                                                                                      |
+| --------------------- | ----- | ------------------------------------------------------------------------------------------------ |
+| `--incremental`       | `-i`  | Wrap only docstrings affected by changes since the last commit                                   |
+| `--incremental-level` |       | How much around each change to wrap (`file`, `definition`, `docstring`); implies `--incremental` |
+| `--no-incremental`    |       | Wrap every docstring, even when configuration enables incremental mode                           |
 
 These three flags are mutually exclusive. `--incremental-level` implicitly enables incremental
 mode.
@@ -96,6 +96,9 @@ When an invocation spans repositories, a `git diff` failure is handled by mode. 
 explicitly enables incremental mode, the failure is fatal for the whole invocation and no files are
 processed. When incremental mode comes from configuration rather than a flag, only the affected
 repository falls back to full wrapping; files in other repositories keep incremental mode.
+
+A repository with no commits yet is not a failure. Every selected file in it is new, so each one is
+fully eligible in both modes, as in the PostToolUse hook.
 
 Each requested file receives one of five outcomes before rendering:
 
@@ -151,8 +154,8 @@ Incremental mode uses the same line-length resolution chain as full mode:
 ## Parallel hook caveat
 
 If multiple agent hooks may modify the same staged file, serialize them under one hook
-registration. The [agent hook guide](hook.md#composing-with-other-hooks) gives a Codex example and
-explains the current Antigravity sequencer incompatibility when a formatter emits a successful
+registration. The [agent hook guide](hook.md#composing-with-other-hooks) explains how to order them
+and the current Antigravity sequencer incompatibility when a formatter emits a successful
 `systemMessage`. Keep the sequencer's deny handling intact.
 
 ## Partial staging

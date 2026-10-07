@@ -68,7 +68,7 @@ _VALID_DETAILS = frozenset({'summary', 'list', 'diff'})
 class DocstringWrapResult:
     """Result of wrapping one parsed docstring.
 
-    Args:
+    Attributes:
         new_literal: Rewritten literal, or None if unchanged.
         summary_skipped: Whether the summary was preserved over wrap target.
         summary_width: Width of the skipped summary, or None.
@@ -96,7 +96,7 @@ class DocstringWrapResult:
 class SourceAnalysis:
     """Result of source-level docstring discovery and parsing.
 
-    Args:
+    Attributes:
         docstrings: Discovered docstring metadata.
         parsed: Parsed docstrings with regions and content.
         parse_error: Whether a syntax error prevented parsing.

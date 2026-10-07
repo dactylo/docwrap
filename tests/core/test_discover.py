@@ -1,4 +1,5 @@
-import logging
+import warnings
+from typing import Literal
 
 import pytest
 
@@ -14,7 +15,7 @@ class TestCodeBlockLines:
     def test_code_block_lines_detected(self) -> None:
         source = 'def foo():\n    """Summary.\n\n    Example::\n\n        x = 1\n    """\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert len(results[0].code_block_lines) > 0
 
 
@@ -163,15 +164,128 @@ class TestFindDocstrings:
             )
 
 
+class TestParseDocstrings:
+    def test_fewer_results_than_input_with_mixed_quotes(self) -> None:
+        source = 'def foo():\n    \'single quoted\'\n\ndef bar():\n    """triple quoted"""\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert len(results) < len(docstrings)
+        assert len(results) == 1
+
+    def test_google_style_detected(self) -> None:
+        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert results[0].detected_name == 'google'
+        assert results[0].style is not None
+
+    def test_multiple_docstrings(self) -> None:
+        source = 'def foo():\n    """Foo summary."""\n\ndef bar():\n    """Bar summary."""\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert len(results) == 2
+
+    def test_no_style_for_plain_docstring(self) -> None:
+        source = 'def foo():\n    """Just a summary."""\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert results[0].detected_name is None
+        assert results[0].style is None
+
+    def test_regions_have_section_header_for_google(self) -> None:
+        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        kinds = [r.kind for r in results[0].regions]
+        assert 'section_header' in kinds
+
+    def test_returns_parsed_for_triple_quoted(self) -> None:
+        source = 'def foo():\n    """Summary line."""\n'
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert len(results) == 1
+        assert isinstance(results[0], ParsedDocstring)
+
+    def test_skips_single_quoted(self) -> None:
+        source = "def foo():\n    'Single quoted.'\n"
+        docstrings = find_docstrings(source)
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
+        assert len(results) == 0
+
+    def test_style_override(self) -> None:
+        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
+        docstrings = find_docstrings(source)
+        config = DocwrapConfig(style='numpy')
+        results = parse_docstrings(source, docstrings, config, skips=[])
+        assert results[0].detected_name == 'numpy'
+
+
+class TestParseSkipDiagnostics:
+    def test_implicit_concatenation_recorded(self) -> None:
+        source = 'def f():\n    """a""" """b"""\n'
+        docstrings = find_docstrings(source)
+        skips: list[DocstringSkip] = []
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
+        assert results == []
+        assert len(skips) == 1
+        assert skips[0].code == 'implicit-concatenation'
+        assert skips[0].qualname == 'f'
+        assert skips[0].line == 2
+        assert skips[0].path == ''
+
+    def test_line_continuation_recorded_others_still_parse(self) -> None:
+        source = (
+            'def f():\n'
+            '    """Line one ' + BACKSLASH + '\n'
+            '    continued."""\n'
+            '\n'
+            '\n'
+            'def g():\n'
+            '    """Short."""\n'
+        )
+        docstrings = find_docstrings(source)
+        skips: list[DocstringSkip] = []
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
+        assert [r.info.qualname for r in results] == ['g']
+        assert len(skips) == 1
+        assert skips[0].code == 'line-continuation'
+        assert skips[0].qualname == 'f'
+        assert skips[0].line == 2
+
+    def test_sentinel_exhaustion_recorded(self) -> None:
+        body = (
+            ''.join(chr(cp) for cp in range(_SENTINEL_MIN, _SENTINEL_MAX + 1))
+            + ' '
+            + BACKSLASH
+            + 'n'
+        )
+        source = 'def f():\n    """' + body + '"""\n'
+        docstrings = find_docstrings(source)
+        skips: list[DocstringSkip] = []
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
+        assert results == []
+        assert len(skips) == 1
+        assert skips[0].code == 'sentinel-unavailable'
+
+
+class TestSourceWarnings:
+    @pytest.mark.parametrize('action', ['always', 'error'])
+    def test_syntax_warning_does_not_escape_discovery(
+        self, action: Literal['always', 'error']
+    ) -> None:
+        source = 'def sample():\n    """A docstring."""\n    return "\\q"\n'
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter(action, SyntaxWarning)
+            found = find_docstrings(source)
+        assert [item.qualname for item in found] == ['sample']
+        assert not emitted
+
+
 class TestOpeningTitleDiscovery:
     @staticmethod
     def _parse(source: str, config: DocwrapConfig | None = None) -> ParsedDocstring:
         docstrings = find_docstrings(source)
-        return parse_docstrings(
-            source,
-            docstrings,
-            config or DocwrapConfig(),
-        )[0]
+        return parse_docstrings(source, docstrings, config or DocwrapConfig(), skips=[])[0]
 
     @pytest.mark.parametrize(
         ('title_lines', 'body', 'detected_name', 'body_kind'),
@@ -388,172 +502,54 @@ class TestOpeningTitleDiscovery:
         assert parsed.regions[0].kind == 'title'
 
 
-class TestParseDocstrings:
-    def test_fewer_results_than_input_with_mixed_quotes(self) -> None:
-        source = 'def foo():\n    \'single quoted\'\n\ndef bar():\n    """triple quoted"""\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert len(results) < len(docstrings)
-        assert len(results) == 1
-
-    def test_google_style_detected(self) -> None:
-        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert results[0].detected_name == 'google'
-        assert results[0].style is not None
-
-    def test_multiple_docstrings(self) -> None:
-        source = 'def foo():\n    """Foo summary."""\n\ndef bar():\n    """Bar summary."""\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert len(results) == 2
-
-    def test_no_style_for_plain_docstring(self) -> None:
-        source = 'def foo():\n    """Just a summary."""\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert results[0].detected_name is None
-        assert results[0].style is None
-
-    def test_regions_have_section_header_for_google(self) -> None:
-        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        kinds = [r.kind for r in results[0].regions]
-        assert 'section_header' in kinds
-
-    def test_returns_parsed_for_triple_quoted(self) -> None:
-        source = 'def foo():\n    """Summary line."""\n'
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert len(results) == 1
-        assert isinstance(results[0], ParsedDocstring)
-
-    def test_skips_single_quoted(self) -> None:
-        source = "def foo():\n    'Single quoted.'\n"
-        docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert len(results) == 0
-
-    def test_style_override(self) -> None:
-        source = 'def foo(x):\n    """Summary.\n\n    Args:\n        x: A value.\n    """\n'
-        docstrings = find_docstrings(source)
-        config = DocwrapConfig(style='numpy')
-        results = parse_docstrings(source, docstrings, config)
-        assert results[0].detected_name == 'numpy'
-
-    def test_warns_unmappable_triple_quoted(self, caplog: pytest.LogCaptureFixture) -> None:
-        source = 'def foo():\n    """a""""""b"""\n'
-        docstrings = find_docstrings(source)
-        assert len(docstrings) == 1
-        with caplog.at_level(logging.WARNING, logger='docwrap._core'):
-            results = parse_docstrings(source, docstrings, DocwrapConfig())
-        assert len(results) == 0
-        assert any('could not map docstring literal' in rec.message for rec in caplog.records)
-
-
-class TestParseSkipDiagnostics:
-    def test_implicit_concatenation_recorded(self) -> None:
-        source = 'def f():\n    """a""" """b"""\n'
-        docstrings = find_docstrings(source)
-        skips: list[DocstringSkip] = []
-        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
-        assert results == []
-        assert len(skips) == 1
-        assert skips[0].code == 'implicit-concatenation'
-        assert skips[0].qualname == 'f'
-        assert skips[0].line == 2
-        assert skips[0].path == ''
-
-    def test_line_continuation_recorded_others_still_parse(self) -> None:
-        source = (
-            'def f():\n'
-            '    """Line one ' + BACKSLASH + '\n'
-            '    continued."""\n'
-            '\n'
-            '\n'
-            'def g():\n'
-            '    """Short."""\n'
-        )
-        docstrings = find_docstrings(source)
-        skips: list[DocstringSkip] = []
-        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
-        assert [r.info.qualname for r in results] == ['g']
-        assert len(skips) == 1
-        assert skips[0].code == 'line-continuation'
-        assert skips[0].qualname == 'f'
-        assert skips[0].line == 2
-
-    def test_sentinel_exhaustion_recorded(self) -> None:
-        body = (
-            ''.join(chr(cp) for cp in range(_SENTINEL_MIN, _SENTINEL_MAX + 1))
-            + ' '
-            + BACKSLASH
-            + 'n'
-        )
-        source = 'def f():\n    """' + body + '"""\n'
-        docstrings = find_docstrings(source)
-        skips: list[DocstringSkip] = []
-        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=skips)
-        assert results == []
-        assert len(skips) == 1
-        assert skips[0].code == 'sentinel-unavailable'
-
-    def test_skips_param_defaults_to_none(self) -> None:
-        source = 'def f():\n    """a""" """b"""\n'
-        docstrings = find_docstrings(source)
-        assert parse_docstrings(source, docstrings, DocwrapConfig()) == []
-
-
 class TestParsedDocstringFields:
     def test_base_indent(self) -> None:
         source = 'def foo():\n    """Summary line."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].base_indent == 4
 
     def test_base_indent_module_level(self) -> None:
         source = '"""Module doc."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].base_indent == 0
 
     def test_col_offset(self) -> None:
         source = 'def foo():\n    """Summary line."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].col_offset == 4
 
     def test_content_is_normalized(self) -> None:
         source = 'def foo():\n    """Summary line."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].content == 'Summary line.'
 
     def test_non_ascii_col_offset(self) -> None:
         source = 'x = "' + chr(233) + '"\ndef foo():\n    """Summary."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         # Docstring is indented 4 spaces on its own line
         assert results[0].col_offset == 4
 
     def test_original_position_first_line(self) -> None:
         source = 'def foo():\n    """Summary line."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].original_position == 'first-line'
 
     def test_original_position_second_line(self) -> None:
         source = 'def foo():\n    """\n    Summary line.\n    """\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].original_position == 'second-line'
 
     def test_regions_contain_summary(self) -> None:
         source = 'def foo():\n    """Summary line."""\n'
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         kinds = [r.kind for r in results[0].regions]
         assert 'summary' in kinds
 
@@ -576,7 +572,7 @@ class TestParsedDocstringFields:
         expected: tuple[str, ...],
     ) -> None:
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert results[0].source_lines == expected
 
 
@@ -594,6 +590,7 @@ class TestPhysicalSourceLines:
             found,
             DocwrapConfig(),
             source_lines=split_source_lines(source) if presplit else None,
+            skips=[],
         )
         assert len(results) == 1
         parsed = results[0]
@@ -616,7 +613,7 @@ class TestPhysicalSourceLines:
         assert (value.lineno, value.end_lineno) == (2, 4)
         assert value.col_offset == len(prefix.encode('utf-8'))
         assert value.end_col_offset == len('End."""')
-        parsed = parse_docstrings(source, found, DocwrapConfig())[0]
+        parsed = parse_docstrings(source, found, DocwrapConfig(), skips=[])[0]
         assert parsed.lit.raw_literal == literal
         assert parsed.col_offset == len(prefix)
         assert parsed.source_lines == (

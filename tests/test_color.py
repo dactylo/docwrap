@@ -1,8 +1,10 @@
 import io
 import sys
+from pathlib import PurePath, PurePosixPath, PureWindowsPath
 
 import pytest
 
+from docwrap import _color
 from docwrap._color import (
     _BLUE,
     _CYAN,
@@ -131,3 +133,26 @@ class TestVisibleControls:
         self, preserve_lf: bool, expected: str
     ) -> None:
         assert visible_controls('first\nsecond\r', preserve_lf=preserve_lf) == expected
+
+
+@pytest.mark.parametrize(
+    ('path', 'expected'),
+    [
+        (PureWindowsPath('src/package/file.py'), 'src/package/file.py'),
+        (PureWindowsPath('C:/my project/file.py'), 'C:/my project/file.py'),
+        (PureWindowsPath('C:relative/file.py'), 'C:relative/file.py'),
+        (PureWindowsPath('//server/share/file.py'), '//server/share/file.py'),
+        (PureWindowsPath('//?/C:/repo/file.py'), str(PureWindowsPath('//?/C:/repo/file.py'))),
+        (PureWindowsPath('//./pipe/tool'), str(PureWindowsPath('//./pipe/tool'))),
+        (PurePosixPath(r'src/literal\name.py'), r'src/literal\name.py'),
+        (PurePosixPath('/repo/my project/file.py'), '/repo/my project/file.py'),
+    ],
+)
+def test_display_paths_preserve_meaning(path: PurePath, expected: str) -> None:
+    assert _color.path_text(path) == expected
+
+
+def test_native_windows_text_keeps_relative_spelling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_color, 'PurePath', PureWindowsPath)
+    assert _color.path_text(r'.\src\file.py') == './src/file.py'
+    assert _color.path_text(r'\??\C:\repo\file.py') == r'\??\C:\repo\file.py'

@@ -13,7 +13,7 @@ post-tool handling. `command_cwd` is the directory the command executes in, or
 `None` when the host contract does not establish it; the core then denies a
 committing command unless it names an absolute route.
 
-Docwrap selects the adapter named by `docwrap hook --agent NAME`, refuses an
+docwrap selects the adapter named by `docwrap hook --agent NAME`, refuses an
 adapter whose `api_version` differs from `API_VERSION`, and never infers the
 host from the payload. Classification, Git operations, and the allow or deny
 decision never depend on the adapter.

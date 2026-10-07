@@ -4,8 +4,14 @@ import ast
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Literal
 
-from docwrap._core._discover import definition_key, find_docstrings
+from docwrap._core._discover import (
+    definition_key,
+    docstring_expression,
+    find_docstrings,
+    parse_source,
+)
 from docwrap._git_utils import decode_git_quoted_path
 from docwrap._types import EligibleTarget, IncrementalLevel
 
@@ -78,11 +84,9 @@ def _deleted_docstrings(
     for node in ast.walk(old_tree):
         if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not node.body or not isinstance(node.body[0], ast.Expr):
+        if (expression := docstring_expression(node)) is None:
             continue
-        value = node.body[0].value
-        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
-            continue
+        value = expression.value
         literal_lines = range(value.lineno, (value.end_lineno or value.lineno) + 1)
         if deleted_lines.isdisjoint(literal_lines):
             continue
@@ -181,7 +185,7 @@ def _deleted_eligibility(
         current_lines[start:end] = [None] * len(removed)
         deleted[start:end] = [start == end] * len(removed)
     try:
-        old_tree = ast.parse(b'\n'.join(old_lines))
+        old_tree = parse_source(b'\n'.join(old_lines))
     except SyntaxError:
         # A repair can leave valid current source over an invalid baseline.
         # Keep current-line eligibility, without guessing deletion ownership.
@@ -283,7 +287,7 @@ def get_eligible_ranges(
         return set()
 
     if level == 'file':
-        ast.parse(source)
+        parse_source(source)
         return None  # All docstrings eligible
 
     # Build set of changed line numbers
@@ -291,7 +295,7 @@ def get_eligible_ranges(
     for start, end, _removed in changed_lines:
         changed_set.update(range(start, end + 1))
 
-    tree = ast.parse(source)
+    tree = parse_source(source)
     eligible = _deleted_eligibility(source, changed_lines, tree, level, encoding)
     if level == 'docstring':
         return eligible | _collect_eligible_docstrings(source, changed_set)
@@ -368,7 +372,7 @@ def resolve_incremental_level(
     *,
     override: bool | None,
     explicit_level: IncrementalLevel | None = None,
-    config_value: IncrementalLevel | bool | None = None,
+    config_value: IncrementalLevel | Literal[False] | None = None,
 ) -> IncrementalLevel | None:
     """Resolve the effective incremental level from override flags + config.
 
@@ -385,8 +389,8 @@ def resolve_incremental_level(
             defer to config_value.
         explicit_level: An explicit level (takes precedence over
             override=True).
-        config_value: The resolved config value: an incremental level string, a
-            bool, or None.
+        config_value: The resolved config value: an incremental level string,
+            False, or None.
 
     Returns:
         The resolved IncrementalLevel, or None for full (non-incremental) mode.

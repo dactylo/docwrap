@@ -1,4 +1,4 @@
-from typing import ClassVar, cast
+from typing import ClassVar
 
 import pytest
 
@@ -8,6 +8,16 @@ from docwrap._core._codeblock import (
 
 
 class TestAlignedRows:
+    def test_continuation_before_second_row_and_blank_boundary(self) -> None:
+        lines = [
+            '`scalar`   a number',
+            '           continued',
+            '`mapping`  a rollup',
+            '',
+            'Ordinary prose.',
+        ]
+        assert find_code_block_lines(lines) == {0, 1, 2}
+
     @pytest.mark.parametrize('indent', ['', '    '])
     def test_rows_and_description_continuations(self, indent: str) -> None:
         lines = [
@@ -19,16 +29,6 @@ class TestAlignedRows:
             'Following prose.',
         ]
         assert find_code_block_lines(lines) == {1, 2, 3, 4}
-
-    def test_continuation_before_second_row_and_blank_boundary(self) -> None:
-        lines = [
-            '`scalar`   a number',
-            '           continued',
-            '`mapping`  a rollup',
-            '',
-            'Ordinary prose.',
-        ]
-        assert find_code_block_lines(lines) == {0, 1, 2}
 
     @pytest.mark.parametrize(
         'lines',
@@ -98,16 +98,13 @@ class TestFencedBlocks:
 
     @pytest.mark.parametrize(
         ('lines', 'protected'),
-        cast(
-            'list[tuple[list[str], set[int]]]',
-            [
-                (['Text.', '', '~~~', 'code()', '~~~', 'After.'], {2, 3, 4}),
-                (['~~~python', 'code()', '~~~~', 'After.'], {0, 1, 2}),
-                (['Heading', '~~~', 'After.'], set()),
-                (['', '~~~python', 'After.'], set()),
-                (['Heading', '~~~~', 'After.'], set()),
-            ],
-        ),
+        [
+            (['Text.', '', '~~~', 'code()', '~~~', 'After.'], {2, 3, 4}),
+            (['~~~python', 'code()', '~~~~', 'After.'], {0, 1, 2}),
+            (['Heading', '~~~', 'After.'], set[int]()),
+            (['', '~~~python', 'After.'], set[int]()),
+            (['Heading', '~~~~', 'After.'], set[int]()),
+        ],
     )
     def test_tilde_requires_matching_closer(
         self,

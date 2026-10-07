@@ -1,4 +1,4 @@
-import io
+import errno
 import os
 import subprocess
 from collections.abc import Iterator
@@ -14,7 +14,6 @@ from docwrap._files import (
     decode_python_source,
     detect_newline,
     encode_with_newline,
-    ensure_utf8_stdio,
     read_file,
     read_file_result,
     write_preserving_newline,
@@ -109,6 +108,7 @@ class TestCollectFiles:
         failure: str,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         source = tmp_path / 'source.py'
         source.write_text('x = 1\n', encoding='utf-8')
@@ -118,9 +118,43 @@ class TestCollectFiles:
                 raise OSError
             return subprocess.CompletedProcess([], 128, b'source.py\0', b'failure')
 
-        monkeypatch.setattr(files_mod.subprocess, 'run', fail_git)
+        monkeypatch.setattr(subprocess, 'run', fail_git)
 
         assert collect_files([str(tmp_path)]) == [source]
+        assert capsys.readouterr().err == ''
+
+    @pytest.mark.parametrize(
+        ('git_stderr', 'detail'),
+        [
+            (
+                b"fatal: detected dubious ownership in repository at '/x'\nhint\n",
+                "fatal: detected dubious ownership in repository at '/x'",
+            ),
+            (b'', 'git exited with status 128'),
+        ],
+    )
+    def test_git_failure_inside_worktree_warns(
+        self,
+        git_stderr: bytes,
+        detail: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / '.git').mkdir()
+        source = tmp_path / 'source.py'
+        source.write_text('x = 1\n', encoding='utf-8')
+
+        def fail_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess([], 128, b'', git_stderr)
+
+        monkeypatch.setattr(subprocess, 'run', fail_git)
+
+        assert collect_files([str(tmp_path)]) == [source]
+        assert capsys.readouterr().err == (
+            f'warning: cannot apply Git exclusions in {tmp_path}: {detail}; '
+            'keeping every discovered Python file\n'
+        )
 
     def test_git_filter_uses_absolute_executable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -129,10 +163,8 @@ class TestCollectFiles:
         source.write_text('pass\n')
 
         def capture_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            executable = kwargs['executable']
-            assert isinstance(executable, str)
-            assert Path(executable).is_absolute()
-            assert args == ['git', 'check-ignore', '-z', '--stdin']
+            assert Path(args[0]).is_absolute()
+            assert args[1:] == ['check-ignore', '-z', '--stdin']
             assert kwargs['cwd'] == tmp_path
             assert kwargs['input'] == b'space name.py\0'
             return subprocess.CompletedProcess(args, 0, b'space name.py\0', b'')
@@ -140,8 +172,24 @@ class TestCollectFiles:
         monkeypatch.setattr(subprocess, 'run', capture_run)
         assert collect_files([str(tmp_path)]) == []
 
-    def test_missing_git_falls_back_to_filesystem(
+    def test_git_value_error_propagates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / 'source.py').write_text('x = 1\n')
+
+        def invalid_run(*_args: object, **_kwargs: object) -> None:
+            raise ValueError('invalid subprocess argument')
+
+        monkeypatch.setattr(subprocess, 'run', invalid_run)
+
+        with pytest.raises(ValueError, match='invalid subprocess argument'):
+            collect_files([str(tmp_path)])
+
+    def test_missing_git_falls_back_to_filesystem(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         source = tmp_path / 'source.py'
         source.write_text('pass\n')
@@ -152,6 +200,61 @@ class TestCollectFiles:
 
         monkeypatch.setattr(subprocess, 'run', unexpected_run)
         assert collect_files([str(tmp_path)]) == [source]
+        assert capsys.readouterr().err == ''
+
+    def test_missing_git_inside_worktree_warns(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / '.git').mkdir()
+        source = tmp_path / 'source.py'
+        source.write_text('pass\n')
+        monkeypatch.setenv('PATH', str(tmp_path))
+
+        assert collect_files([str(tmp_path)]) == [source]
+        assert capsys.readouterr().err == (
+            f'warning: cannot apply Git exclusions in {tmp_path}: git could not be run; '
+            'keeping every discovered Python file\n'
+        )
+
+    def test_nested_git_failures_warn_once_per_root_in_first_seen_order(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / '.git').mkdir()
+        outer_file = tmp_path / 'outer.py'
+        outer_file.write_text('x = 1\n', encoding='utf-8')
+        nested_roots = [tmp_path / 'nested_a', tmp_path / 'nested_b']
+        nested_files: list[Path] = []
+        for root in nested_roots:
+            root.mkdir()
+            (root / '.git').mkdir()
+            source = root / 'inside.py'
+            source.write_text('x = 2\n', encoding='utf-8')
+            nested_files.append(source)
+
+        calls: list[Path] = []
+
+        def fail_git(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            root = kwargs['cwd']
+            assert isinstance(root, Path)
+            calls.append(root)
+            detail = f'{root.name} failure {calls.count(root)}'.encode()
+            return subprocess.CompletedProcess(args, 128, b'', detail)
+
+        monkeypatch.setattr(subprocess, 'run', fail_git)
+
+        assert collect_files([str(tmp_path)]) == sorted([outer_file, *nested_files])
+        assert calls == [tmp_path, tmp_path, tmp_path, *nested_roots]
+        assert capsys.readouterr().err.splitlines() == [
+            f'warning: cannot apply Git exclusions in {root}: {root.name} failure 1; '
+            'keeping every discovered Python file'
+            for root in [tmp_path, *nested_roots]
+        ]
 
     def test_nested_git_worktree_uses_own_tracked_state(self, tmp_path: Path) -> None:
         run_setup(['git', 'init', '-q'], cwd=tmp_path)
@@ -306,74 +409,6 @@ class TestEncodeWithNewline:
         assert b'\r\r\n' not in result
 
 
-class TestEnsureUtf8Stdio:
-    def test_noop_without_reconfigure(self) -> None:
-        ensure_utf8_stdio()  # StringIO lacks reconfigure; should not raise
-
-    def test_preserves_error_handler(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[dict[str, str]] = []
-
-        class _FakeStream:
-            errors = 'surrogateescape'
-
-            def reconfigure(self, **kw: str) -> None:
-                calls.append(kw)
-
-        monkeypatch.setattr('sys.stdin', io.StringIO())  # no reconfigure
-        monkeypatch.setattr('sys.stdout', _FakeStream())
-        monkeypatch.setattr('sys.stderr', io.StringIO())  # no reconfigure
-        ensure_utf8_stdio()
-        assert calls == [{'encoding': 'utf-8', 'errors': 'surrogateescape'}]
-
-    def test_reconfigures_stderr(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[tuple[str, str]] = []
-
-        class _FakeStream:
-            errors = None
-
-            def reconfigure(self, *, encoding: str, errors: str | None) -> None:
-                del errors
-                calls.append(('stderr', encoding))
-
-        monkeypatch.setattr('sys.stdin', io.StringIO())
-        monkeypatch.setattr('sys.stdout', io.StringIO())
-        monkeypatch.setattr('sys.stderr', _FakeStream())
-        ensure_utf8_stdio()
-        assert calls == [('stderr', 'utf-8')]
-
-    def test_reconfigures_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[tuple[str, str]] = []
-
-        class _FakeStream:
-            errors = None
-
-            def reconfigure(self, *, encoding: str, errors: str | None) -> None:
-                del errors
-                calls.append(('stdin', encoding))
-
-        monkeypatch.setattr('sys.stdin', _FakeStream())
-        monkeypatch.setattr('sys.stdout', io.StringIO())
-        monkeypatch.setattr('sys.stderr', io.StringIO())
-        ensure_utf8_stdio()
-        assert calls == [('stdin', 'utf-8')]
-
-    def test_reconfigures_stdout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[tuple[str, str]] = []
-
-        class _FakeStream:
-            errors = None
-
-            def reconfigure(self, *, encoding: str, errors: str | None) -> None:
-                del errors
-                calls.append(('stdout', encoding))
-
-        monkeypatch.setattr('sys.stdin', io.StringIO())
-        monkeypatch.setattr('sys.stdout', _FakeStream())
-        monkeypatch.setattr('sys.stderr', io.StringIO())
-        ensure_utf8_stdio()
-        assert calls == [('stdout', 'utf-8')]
-
-
 class TestFileIdentityDedup:
     def test_case_alias_dedups_to_first(self, tmp_path: Path) -> None:
         target = tmp_path / 'CaseFile.py'
@@ -518,6 +553,72 @@ class TestSkipDirs:
 
 
 class TestWritePreservingNewline:
+    def test_empty_original_bytes_use_lf(self, tmp_path: Path) -> None:
+        path = tmp_path / 'empty.py'
+        path.write_bytes(b'')
+
+        write_preserving_newline(path, 'new\nline\n', 'utf-8', raw=b'')
+
+        assert path.read_bytes() == b'new\nline\n'
+
+    def test_failed_restore_reports_both_errors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / 'partial.py'
+        raw = b'original\n'
+        path.write_bytes(raw)
+        original_write_bytes = Path.write_bytes
+        write_error = OSError(errno.ENOSPC, 'No space left on device')
+        calls = 0
+
+        def failed_writes(candidate: Path, data: bytes) -> int:
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(candidate, data[: len(data) // 2])
+                    raise write_error
+                raise OSError('restore failed')
+            return original_write_bytes(candidate, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', failed_writes)
+
+        with pytest.raises(files_mod.RestoreError) as exc_info:
+            write_preserving_newline(path, 'replacement\n', 'utf-8', raw=raw)
+
+        assert exc_info.value.errno == errno.ENOSPC
+        assert exc_info.value.__cause__ is write_error
+        assert 'No space left on device' in str(exc_info.value)
+        assert 'restore failed' in str(exc_info.value)
+        assert calls == 2
+
+    def test_failed_write_restores_original_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / 'partial.py'
+        raw = b'original\n'
+        path.write_bytes(raw)
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def partial_write(candidate: Path, data: bytes) -> int:
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(candidate, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+            return original_write_bytes(candidate, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', partial_write)
+
+        with pytest.raises(OSError, match='No space left on device') as exc_info:
+            write_preserving_newline(path, 'replacement\n', 'utf-8', raw=raw)
+
+        assert exc_info.value.errno == errno.ENOSPC
+        assert calls == 2
+        assert path.read_bytes() == raw
+
     def test_original_bytes_select_any_crlf_policy(self, tmp_path: Path) -> None:
         path = tmp_path / 'mixed.py'
         path.write_bytes(b'old\r\nline\n')

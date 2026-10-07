@@ -12,6 +12,7 @@ from docwrap._color import (
     YELLOW,
     bold_if,
     colorize,
+    path_text,
     percentile_color,
     visible_controls,
 )
@@ -20,6 +21,7 @@ from docwrap._stats import (
     BUCKET_BOUNDS,
     PERCENTILE_LEVELS,
     STANDARD_LENGTHS,
+    WRAPPABLE_CATEGORIES,
     Bucket,
     Histogram,
     ImpactRow,
@@ -44,7 +46,6 @@ from docwrap._types import (
 _MarkerPayload = tuple[int, list[str]]
 _MAX_BAR_WIDTH = 30
 _StatsRow = tuple[str, *tuple[int, ...]]
-_WRAPPABLE_CATEGORIES = ('prose', 'args', 'summary')
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +360,7 @@ def _emit_impact_rows(
 
 
 def _format_outlier_chars(length: int, color: bool, line_length: int | None) -> str:
-    """Format a character count for an outlier line."""
+    """Render an outlier's character count with optional percentile color."""
     chars_str = str(length)
     if color:
         pc = percentile_color(length, line_length)
@@ -369,7 +370,7 @@ def _format_outlier_chars(length: int, color: bool, line_length: int | None) -> 
 
 
 def _level_display_name(level: int) -> str:
-    """Return the fixed display name for a percentile level."""
+    """Name the median specially and prefix other percentile levels with `p`."""
     return 'median' if level == 50 else f'p{level}'  # noqa: PLR2004
 
 
@@ -557,7 +558,7 @@ def _print_docstring_tables(ctx: _StatsRenderCtx, *, leading_blank: bool) -> boo
 
     wrappable_rows, all_wrappable = _build_group_rows(
         _group_by_category(wrappable_ms),
-        _WRAPPABLE_CATEGORIES,
+        WRAPPABLE_CATEGORIES,
     )
     if wrappable_rows:
         percentiles = compute_percentiles(all_wrappable)
@@ -651,13 +652,13 @@ def _print_impact_table(
 
 
 def _print_safety_skip_footer(count: int) -> None:
-    """Print the safety-skip footer line."""
+    """Report docstrings left unchanged for safety."""
     label = pluralize('docstring', count)
     print(f'\n  Skipped {count} {label} for safety.')
 
 
 def _print_skipped_footer(count: int) -> None:
-    """Print skipped files footer."""
+    """Report unreadable files omitted from statistics."""
     fs = pluralize('file', count)
     print(f'\n  Skipped {count} {fs} (unreadable).')
 
@@ -730,7 +731,7 @@ def _print_outliers(
     boundaries = ctx.source_zone_boundaries
 
     any_printed = False
-    for cat in _WRAPPABLE_CATEGORIES:
+    for cat in WRAPPABLE_CATEGORIES:
         cat_ms = [m for m in ctx.measurements if m.wrappable and m.category == cat]
         outliers = find_outliers(cat_ms, n=limit)
         if not outliers:
@@ -742,7 +743,7 @@ def _print_outliers(
             any_printed = True
         print(f'\n    {cat}:')
         for m in outliers:
-            loc = visible_controls(f'{m.file_path}:{m.line_number}')
+            loc = visible_controls(f'{path_text(m.file_path)}:{m.line_number}')
             if ctx.color:
                 loc = colorize(loc, BOLD)
             annotation = _format_outlier_annotation(m.length, boundaries)
@@ -911,7 +912,7 @@ def _print_distributions(
 
     by_cat = _group_by_category(
         [m for m in ctx.measurements if m.wrappable],
-        _WRAPPABLE_CATEGORIES,
+        WRAPPABLE_CATEGORIES,
     )
 
     all_wrappable = [m for cat_ms in by_cat.values() for m in cat_ms]
@@ -921,7 +922,7 @@ def _print_distributions(
     separator = '\n' if leading_blank else ''
     print(f'{separator}{bold_if("Distribution", ctx.color)}\n')
 
-    for cat in _WRAPPABLE_CATEGORIES:
+    for cat in WRAPPABLE_CATEGORIES:
         cat_ms = by_cat.get(cat, [])
         if not cat_ms:
             continue

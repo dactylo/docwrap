@@ -130,8 +130,8 @@ def _is_annotation_node(node: ast.AST, *, in_subscript: bool = False) -> bool:
     return result
 
 
-class GoogleStyle:
-    """Concrete `Style` implementation for Google-style docstrings."""
+class _GoogleStyle:
+    """Parse and format Google-style docstrings."""
 
     name: StyleName = 'google'
     known_headers = _ENTRY_LIKE | _PROSE_LIKE
@@ -194,9 +194,9 @@ class GoogleStyle:
             return None
         try:
             node = ast.parse(prefix, mode='eval').body
-        except SyntaxError:
-            return None
-        if not _is_annotation_node(node):
+            if not _is_annotation_node(node):
+                return None
+        except (RecursionError, SyntaxError):
             return None
         remainder = content[colon_end:]
         description = remainder.strip()
@@ -332,6 +332,18 @@ class GoogleStyle:
             return []
         return [f'{name}:']
 
+    def is_conservative_entry_candidate(self, content: str) -> bool:
+        """Protect a nonempty colon prefix that could become a Google entry.
+
+        Args:
+            content: Line content after the entry indentation.
+
+        Returns:
+            Whether a nonempty prefix precedes a colon.
+        """
+        prefix, separator, _ = content.partition(':')
+        return bool(separator and prefix.strip())
+
     def is_section_header(self, line: str, next_line: str | None = None) -> str | None:  # noqa: ARG002
         """Return section name if line is a Google-style header.
 
@@ -419,5 +431,5 @@ class GoogleStyle:
         return role in _GOOGLE_CANONICAL_TO_HEADER
 
 
-_INSTANCE = GoogleStyle()
+_INSTANCE = _GoogleStyle()
 STYLE = _INSTANCE

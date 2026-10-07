@@ -2,7 +2,7 @@
 
 ## Local environment
 
-Run `make setup` from the checkout with uv 0.12.13 and a supported `python` on `PATH`. It
+Run `make setup` from the checkout with uv 0.12.23 and a supported `python` on `PATH`. It
 synchronizes the hashed development lock into `.venv` and installs the checkout in editable mode.
 `make quality` runs the read-only formatting, lock, type, dead-code, manifest, and whitespace
 checks; `make check` adds the full test suite. `make test` runs that suite alone, and `make format`
@@ -93,5 +93,4 @@ executable supplies the formatter instead. For local Markdown formatting, provid
 ## Test selection
 
 Workers use the available CPU count. Use `-n 0` for a serial debugging run; plain `make test`
-remains serial. Test jobs allow 30 minutes on Linux and hosted macOS, and 45 minutes on hosted
-Windows.
+remains serial.

@@ -23,8 +23,8 @@ For agent-triggered commits and edits, see the [agent hook guide](hook.md).
 ## Synopsis
 
 ```text
-docwrap [options] [PATH...]
-docwrap hook -a NAME [-e NAME] [-i | --no-incremental] [--allow-on-failure]
+docwrap [options] [PATH ...]
+docwrap hook --agent NAME [options]
 ```
 
 `docwrap` accepts `.py` files or directories (recursively expanded to `**/*.py`). Existing
@@ -34,10 +34,11 @@ errors. Every recursive scan prunes common non-source directories (`.git`, `__py
 those directories are therefore omitted from directory scans. Among the remaining paths, Git
 worktree scans include tracked files and untracked, non-ignored files while honoring standard Git
 exclusions. An explicitly named Python file remains eligible even when Git ignores it or its parent
-directory has a skipped name. Nested worktrees apply their own tracked state and exclusions.
-Symlinks are processed when passed explicitly but skipped during directory recursion. Paths default
-to `.` when omitted. `hook` is the agent hook entry point; `-a`/`--agent` selects the agent adapter
-(see [hook.md](hook.md)).
+directory has a skipped name. Nested worktrees apply their own tracked state and exclusions. If Git
+is unavailable or fails inside a worktree, docwrap warns with the reason and keeps every discovered
+Python file. Outside a worktree, the filesystem fallback is silent. Symlinks are processed when
+passed explicitly but skipped during directory recursion. Paths default to `.` when omitted. `hook`
+is the agent hook entry point; `-a`/`--agent` selects the agent adapter (see [hook.md](hook.md)).
 
 ## Options
 
@@ -46,54 +47,54 @@ if that metadata is unavailable.
 
 ### Output modes (mutually exclusive)
 
-| Flag        | Short | Description                     |
-| ----------- | ----- | ------------------------------- |
-| `--preview` | `-p`  | Show per-docstring before/after |
-| `--stats`   | `-s`  | Show line length statistics     |
-| `--diff`    | `-d`  | Show unified diff               |
-| `--json`    | `-j`  | Output to JSON                  |
-| `--write`   | `-w`  | Modify files in place           |
+| Flag        | Short | Description                                                 |
+| ----------- | ----- | ----------------------------------------------------------- |
+| `--preview` | `-p`  | Show each docstring that would change                       |
+| `--diff`    | `-d`  | Show a unified diff                                         |
+| `--write`   | `-w`  | Rewrite files in place                                      |
+| `--json`    | `-j`  | Print results as JSON                                       |
+| `--stats`   | `-s`  | Report docstring line lengths and help choose a line length |
 
 Without a mode flag, `docwrap` shows a per-file summary of changed docstrings. Modes are mutually
 exclusive -- only one may be specified at a time.
 
 ### Modifiers
 
-| Flag                                   | Short | Description                                                       |
-| -------------------------------------- | ----- | ----------------------------------------------------------------- |
-| `--length`                             | `-l`  | Target line length (default: 79)                                  |
-| `--verbose`                            | `-v`  | Include unchanged files in summary                                |
-| `--color`                              |       | Color output (default: `auto`)                                    |
-| `--style`                              |       | Override convention (google, numpy, sphinx)                       |
-| `--convert`                            |       | Convert to style (google, numpy, sphinx)                          |
-| `--strip-types`                        |       | Strip inline type annotations                                     |
-| `--summary-start`                      |       | Summary position relative to opening quotes (default: `preserve`) |
-| `--wrap-summary` / `--no-wrap-summary` |       | Enable or disable summary wrapping (built-in default: disabled)   |
-| `--show-skips`                         |       | Show skipped-summary preview diagnostics                          |
-| `--hide-skips`                         |       | Hide skipped-summary preview diagnostics                          |
-| `--fill-style`                         |       | Fill style: `smart`, `greedy`, or `balanced` (default: `smart`)   |
-| `--smart-slack`                        |       | Smart-fill break-repair budget (default: `8`)                     |
-| `--reflow`                             |       | Reflow mode: `none`, `cautious`, or `full` (default: `cautious`)  |
+| Flag                                   | Short | Description                                                                                        |
+| -------------------------------------- | ----- | -------------------------------------------------------------------------------------------------- |
+| `--length`                             | `-l`  | Maximum line length (default: 79)                                                                  |
+| `--verbose`                            | `-v`  | Also list unchanged files                                                                          |
+| `--color`                              |       | When to use color (default: `auto`)                                                                |
+| `--style`                              |       | Use this docstring style instead of detecting each docstring's style (`google`, `numpy`, `sphinx`) |
+| `--convert`                            |       | Rewrite docstrings in another style (`google`, `numpy`, `sphinx`)                                  |
+| `--strip-types`                        |       | Remove inline types from structured entries                                                        |
+| `--summary-start`                      |       | Where a multi-line summary starts (default: `preserve`)                                            |
+| `--wrap-summary` / `--no-wrap-summary` |       | Wrap summaries longer than the line length (default: off)                                          |
+| `--show-skips`                         |       | In preview, list summaries left unwrapped because they are too long (default: off)                 |
+| `--hide-skips`                         |       | In preview, do not list summaries left unwrapped because they are too long                         |
+| `--fill-style`                         |       | How to choose line breaks: `smart`, `greedy`, or `balanced` (default: `smart`)                     |
+| `--smart-slack`                        |       | Columns smart fill may give up to avoid a stranded fragment (default: `8`)                         |
+| `--reflow`                             |       | How freely to rejoin lines before wrapping: `none`, `cautious`, or `full` (default: `cautious`)    |
 
 `--verbose` only affects the default summary and `--write` modes. It is silently ignored with
 `--preview` and `--diff`.
 
 ### Stats-only modifiers
 
-| Flag                           | Value                           | Description                                           |
-| ------------------------------ | ------------------------------- | ----------------------------------------------------- |
-| `--stats-sections`             | `SECTION[,SECTION...]`          | Select stats body sections in exact display order     |
-| `--stats-longest-per-category` | positive integer (default: `3`) | Limit longest lines shown for each wrappable category |
+| Flag                           | Value                           | Description                        |
+| ------------------------------ | ------------------------------- | ---------------------------------- |
+| `--stats-sections`             | `SECTION[,SECTION...]`          | Report sections to show, in order  |
+| `--stats-longest-per-category` | positive integer (default: `3`) | Longest lines to list per category |
 
 Both options are valid only with `-s` or `--stats`.
 
 ### Incremental mode
 
-| Flag                  | Short | Description                                        |
-| --------------------- | ----- | -------------------------------------------------- |
-| `--incremental`       | `-i`  | Enable incremental mode                            |
-| `--incremental-level` |       | Override level (`file`, `definition`, `docstring`) |
-| `--no-incremental`    |       | Explicitly disable incremental mode                |
+| Flag                  | Short | Description                                                                                      |
+| --------------------- | ----- | ------------------------------------------------------------------------------------------------ |
+| `--incremental`       | `-i`  | Wrap only docstrings affected by changes since the last commit                                   |
+| `--incremental-level` |       | How much around each change to wrap (`file`, `definition`, `docstring`); implies `--incremental` |
+| `--no-incremental`    |       | Wrap every docstring, even when configuration enables incremental mode                           |
 
 `-i` / `--incremental`, `--incremental-level`, and `--no-incremental` are mutually exclusive.
 `--incremental-level` implicitly enables incremental mode.
@@ -169,9 +170,13 @@ that changed.
 Analyzes docstring line lengths across the codebase. Shows configured length and scan count, source
 code and docstring percentile tables, distribution histograms, longest wrappable lines, wrapping
 impact at standard line lengths with line-change and scope columns, and recommended targets. Never
-modifies files. A valid stats invocation exits 0, including one with stats display configuration
-warnings. Other invalid project configuration can exit 2. Stats never uses exit 1 for pending
-changes.
+modifies files. A valid stats invocation over readable, parseable files exits 0, including one with
+stats display configuration warnings. Other invalid project configuration can exit 2. Stats never
+uses exit 1 for pending changes.
+
+Unreadable files (including missing paths and decoding failures) are skipped and counted in the
+footer. Files that cannot be parsed are omitted from measurements. Each such file is reported on
+stderr, the report still covers the remaining files, and stats exits 2.
 
 #### Report sections
 
@@ -302,18 +307,21 @@ treat absent optional fields as their documented default.
 
 ## Color
 
-Color output is controlled by a precedence chain:
+Color output is controlled by this precedence chain:
 
-1. CLI `--color` flag (`always` overrides everything, `never` disables)
+1. CLI `--color always` enables color or `--color never` disables it.
 2. `NO_COLOR` environment variable (when set, disables color)
-3. `[tool.docwrap].color` config value
-4. `auto` default (checks whether the output stream is a terminal)
+3. `[tool.docwrap].color` from configuration discovered from the current working directory
+4. `auto` (checks whether the output stream is a terminal)
+
+`--color auto` uses steps 2-4. Color configuration is shared by the invocation; wrapping
+configuration is resolved separately for each input file.
 
 ## Configuration
 
-`docwrap` reads `[tool.docwrap]` from `pyproject.toml`, discovered by walking up from each input
-file and stopping at the git repository root. Configuration in a directory above the repository is
-not used.
+For wrapping settings, `docwrap` reads `[tool.docwrap]` from `pyproject.toml`, discovered by
+walking up from each input file and stopping at the git repository root. Configuration in a
+directory above the repository is not used.
 
 ### Multi-project configuration
 
@@ -349,17 +357,17 @@ the public `DocwrapConfig` record. The operational settings `color`, `incrementa
 
 If `[tool.docwrap]` does not set `line-length`, the default is 79.
 
-A docstring whose content fits in the one-line literal form remains one line. Docwrap checks that
+A docstring whose content fits in the one-line literal form remains one line. docwrap checks that
 fit before applying `summary-start`, including when it is set to `second-line`.
 
-`color` controls ANSI color output. `auto` (default) checks whether the output stream is a
-terminal. The `NO_COLOR` environment variable disables color when set. CLI `--color` flag overrides
-all other settings.
+`color` controls ANSI color output. `auto` checks whether the output stream is a terminal after
+`NO_COLOR` and the current working directory's color configuration are considered. Explicit
+`--color always` and `--color never` override both; `--color auto` does not.
 
-**Precedence**: CLI flags (`--length`, `--style`, `--color`, `--convert`, `--strip-types`,
-`--summary-start`, `--wrap-summary`/`--no-wrap-summary`, `--fill-style`, `--smart-slack`,
-`--reflow`) override `pyproject.toml` values. The built-in default is `--no-wrap-summary`;
-`[tool.docwrap].wrap-summary` overrides that default when neither CLI spelling is present.
+**Precedence**: CLI flags (`--length`, `--style`, `--convert`, `--strip-types`, `--summary-start`,
+`--wrap-summary`/`--no-wrap-summary`, `--fill-style`, `--smart-slack`, `--reflow`) override
+`pyproject.toml` values. The built-in default is `--no-wrap-summary`; `[tool.docwrap].wrap-summary`
+overrides that default when neither CLI spelling is present.
 
 ## Style conversion
 
@@ -374,7 +382,7 @@ or undetected content. Once the converted output contains enough target evidence
 target parser and renderer instead. Partially preserved output may therefore remain mixed rather
 than becoming pure target syntax, but repeated runs keep its converted fields stable.
 
-Docwrap preserves each unsupported section as a complete source-styled span, including its header,
+docwrap preserves each unsupported section as a complete source-styled span, including its header,
 entries, and associated prose. Supported neighboring sections still convert, so the resulting
 docstring may intentionally use mixed styles.
 
@@ -434,8 +442,9 @@ Controls how aggressively docwrap joins lines.
 
 - `none`: Split-only. Lines under the limit are never joined. Lines that overflow are individually
   split.
-- `cautious` (default): Reflow within runs. Joins semantically-joinable lines (mid-sentence,
-  lowercase continuation) into runs and fills each run. Preserves sentence boundaries, colons,
+- `cautious` (default): Reflow within runs. Joins adjacent prose lines when the preceding line has
+  no terminal punctuation and the next starts with a letter, supported inline token, option,
+  parenthesis, or quoted number. Fills each run while preserving sentence boundaries, colons, and
   bullets.
 - `full`: Joins and reflows all lines within each eligible prose region. Protected content such as
   code blocks retains its layout.
@@ -466,6 +475,11 @@ python -m docwrap --diff src/
 
 If stdout closes while docwrap is producing output, docwrap stops writing, examines no further
 files, prints no traceback, and exits with the status of the work completed so far.
+
+If stdout is already closed when docwrap starts, docwrap prints
+`error: standard output is unavailable` to stderr and exits 2 before reading arguments,
+configuration, or files. This applies to every command, including `--help`, `--version`, and
+`hook`.
 
 ## Safety-skip warnings
 

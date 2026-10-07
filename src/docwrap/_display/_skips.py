@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from docwrap._color import visible_controls
+from docwrap._color import path_text, visible_controls
 
 if TYPE_CHECKING:
     from docwrap._types import DocstringSkip
@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 def format_safety_skip(path: str, skip: 'DocstringSkip') -> str:
     """Format a safety skip with visible control characters for terminal output."""
     return (
-        f'{visible_controls(path)}:{skip.line}: '
+        f'{visible_controls(path_text(path))}:{skip.line}: '
         f'{visible_controls(skip.qualname)} skipped '
         f'({visible_controls(skip.code)}): {visible_controls(skip.message)}'
     )

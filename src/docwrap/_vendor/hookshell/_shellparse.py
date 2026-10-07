@@ -2,6 +2,7 @@
 
 # pyright: reportPrivateUsage=false
 
+import re
 from dataclasses import dataclass
 from string import ascii_letters, digits
 
@@ -40,8 +41,8 @@ _SPECIAL_PARAMETERS = frozenset('@*#?-$!0123456789')
 _TERMINATORS = frozenset({'&&', '||', ';', ';;', '|', '|&', '&', '\n'})
 _WORD_BREAKS = frozenset(' \t\n')
 
-type WORD_PART = LiteralPart | SubstitutionPart | ExpansionPart | GlobPart
-type _ELEMENT = Word | Operator | Heredoc | Comment
+type WordPart = LiteralPart | SubstitutionPart | ExpansionPart | GlobPart
+type _Element = Word | Operator | Heredoc | _Comment
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +92,7 @@ class Word:
     """Shell word made of parts, keeping its raw text."""
 
     raw: str
-    parts: tuple[WORD_PART, ...]
+    parts: tuple[WordPart, ...]
 
     @property
     def literal_text(self) -> str | None:
@@ -113,40 +114,19 @@ class Operator:
 
 @dataclass(frozen=True, slots=True)
 class Heredoc:
-    """Heredoc delimiter, quoting, body, and the substitutions an unquoted body expands."""
+    """Heredoc body and expansions, with recovery scan ownership.
+
+    Attributes:
+        body_inlined: Whether detector recovery parsed the body as following
+            segments. Its token text and expansions may be shared with an
+            earlier recovered heredoc, in which case these fields are empty.
+    """
 
     delimiter: str
     quoted: bool
     body: str
     expansions: tuple[SubstitutionPart, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class Comment:
-    """Comment element from `#` to the end of its line."""
-
-    text: str
-
-
-@dataclass(frozen=True, slots=True)
-class Segment:
-    """Elements of one simple command and the operator that terminated it."""
-
-    elements: tuple[_ELEMENT, ...]
-    terminator: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class Command:
-    """Parsed command tree with the recovery reasons a total parse recorded."""
-
-    segments: tuple[Segment, ...]
-    recovery: tuple[str, ...] = ()
-
-    @property
-    def clean(self) -> bool:
-        """Return whether the parse needed no recovery."""
-        return not self.recovery
+    body_inlined: bool = False
 
 
 class _CommandState:
@@ -157,18 +137,41 @@ class _CommandState:
     def __init__(self, *, nested: bool) -> None:
         """Initialize the segments and pending heredocs for one command level."""
         self._nested = nested
-        self._elements: list[list[_ELEMENT]] = []
+        self._elements: list[list[_Element]] = []
         self._terminators: list[str | None] = []
         self._pending: list[_PendingHeredoc] = []
         self._paren_depth = 0
         self._finished = False
 
 
+@dataclass(frozen=True, slots=True)
+class _Comment:
+    """Comment element from `#` to the end of its line."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class Segment:
+    """Elements of one simple command and the operator that terminated it."""
+
+    elements: tuple[_Element, ...]
+    terminator: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Command:
+    """Parsed command tree with the recovery reasons a total parse recorded."""
+
+    segments: tuple[Segment, ...]
+    recovery: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class _PendingHeredoc:
     """Heredoc awaiting its body at the next line feed."""
 
-    _elements: list[_ELEMENT]
+    _elements: list[_Element]
     _index: int
     _delimiter: str
     _quoted: bool
@@ -183,19 +186,24 @@ class _WordState:
     def __init__(self, start: int) -> None:
         """Begin collecting one word at its raw-text offset."""
         self._start = start
-        self._parts: list[WORD_PART] = []
+        self._parts: list[WordPart] = []
         self._run: list[str] = []
 
 
 class _Parser:
     """Recursive-descent parser over one command text."""
 
-    def __init__(self, text: str, depth: int = 0) -> None:
+    def __init__(self, text: str, depth: int = 0, *, recover_heredocs: bool = False) -> None:
         """Bind the input and inherited substitution depth."""
         self._text = text
         self._pos = 0
         self._depth = depth
         self._recovery: list[str] = []
+        self._recover_heredocs = recover_heredocs
+        self._heredoc_ends: dict[tuple[bool, str], int] | None = None
+        self._recovered_body = False
+        self._recovered_expansions = False
+        self._recovered_tabs = False
 
     def _at_end(self) -> bool:
         """Return whether the cursor has consumed the input."""
@@ -206,6 +214,19 @@ class _Parser:
         if state._run:
             state._parts.append(LiteralPart(''.join(state._run), quoted))
             state._run.clear()
+
+    def _has_heredoc_end(self, pending: _PendingHeredoc) -> bool:
+        """Check remaining delimiter lines using one index for this script."""
+        if self._heredoc_ends is None:
+            self._heredoc_ends = {}
+            offset = 0
+            for line in self._text.split('\n'):
+                if offset == len(self._text):
+                    break
+                self._heredoc_ends[False, line] = offset
+                self._heredoc_ends[True, line.lstrip('\t')] = offset
+                offset += len(line) + 1
+        return self._heredoc_ends.get((pending._strip_tabs, pending._delimiter), -1) >= self._pos
 
     def _match_operator(self) -> str | None:
         """Find the longest operator at the current cursor."""
@@ -225,7 +246,7 @@ class _Parser:
         if self._depth >= _MAX_SUBSTITUTION_DEPTH:
             self._recovery.append(_RECOVERY_NESTING)
             return SubstitutionPart(Command(()), raw, in_double_quotes, truncated=True)
-        parser = _Parser(inner, self._depth + 1)
+        parser = _Parser(inner, self._depth + 1, recover_heredocs=self._recover_heredocs)
         command = parser._parse()
         self._recovery.extend(parser._recovery)
         return SubstitutionPart(command, raw, in_double_quotes)
@@ -265,14 +286,16 @@ class _Parser:
             self._pos = close
         else:
             self._pos = close + 1
-        inner = self._text[start + 1 : close].replace('\\`', '`')
+        # Remove one backtick escape layer before parsing the nested shell text.
+        escapes = r'\\([$`\\"])|\\\n' if in_double_quotes else r'\\([$`\\])|\\\n'
+        inner = re.sub(escapes, r'\1', self._text[start + 1 : close])
         return self._nested_substitution(
             inner,
             self._text[start : self._pos],
             in_double_quotes=in_double_quotes,
         )
 
-    def _parse_brace_expansion(self) -> ExpansionPart:
+    def _parse_brace_expansion(self, *, in_double_quotes: bool) -> ExpansionPart:
         """Retain parameter-expansion text and every nested substitution."""
         start = self._pos
         self._pos += 2
@@ -288,7 +311,7 @@ class _Parser:
                     self._pos += 1
                     return ExpansionPart(self._text[start : self._pos], tuple(children))
             elif char == '`' or self._text.startswith('$(', self._pos):
-                part = self._parse_dynamic(in_double_quotes=False)
+                part = self._parse_dynamic(in_double_quotes=in_double_quotes)
                 if isinstance(part, SubstitutionPart):
                     children.append(part)
                 continue
@@ -334,7 +357,7 @@ class _Parser:
         if run or not emitted:
             state._parts.append(LiteralPart(''.join(run), quoted=True))
 
-    def _parse_dynamic(self, *, in_double_quotes: bool) -> WORD_PART:
+    def _parse_dynamic(self, *, in_double_quotes: bool) -> WordPart:
         """Read the expansion or substitution beginning at the cursor."""
         if self._text[self._pos] == '`':
             return self._parse_backtick(in_double_quotes=in_double_quotes)
@@ -342,7 +365,7 @@ class _Parser:
         if following == '(':
             return self._parse_substitution(in_double_quotes=in_double_quotes)
         if following == '{':
-            return self._parse_brace_expansion()
+            return self._parse_brace_expansion(in_double_quotes=in_double_quotes)
         if following in _SPECIAL_PARAMETERS:
             self._pos += 2
             return ExpansionPart(f'${following}')
@@ -470,14 +493,14 @@ class _Parser:
 
     def _scan_heredoc_expansions(self, body: str) -> tuple[SubstitutionPart, ...]:
         """Scan body expansions with structural parsing at each substitution opener."""
-        scanner = _Parser(body, self._depth)
+        scanner = _Parser(body, self._depth, recover_heredocs=self._recover_heredocs)
         found: list[SubstitutionPart] = []
         while not scanner._at_end():
-            char = body[scanner._pos]
+            char = scanner._text[scanner._pos]
             if char == '\\':
-                following = body[scanner._pos + 1 : scanner._pos + 2]
+                following = scanner._text[scanner._pos + 1 : scanner._pos + 2]
                 scanner._pos += 2 if following in ('$', '`', '\\', '\n') else 1
-            elif body.startswith('$(', scanner._pos) or char == '`':
+            elif scanner._text.startswith('$(', scanner._pos) or char == '`':
                 part = scanner._parse_dynamic(in_double_quotes=False)
                 if isinstance(part, SubstitutionPart):
                     found.append(part)
@@ -486,9 +509,32 @@ class _Parser:
         self._recovery.extend(scanner._recovery)
         return tuple(found)
 
+    def _recover_heredoc(self, pending: _PendingHeredoc) -> Heredoc:
+        """Leave an unmatched body's script in place and share its tail scans."""
+        self._recovery.append(_RECOVERY_HEREDOC)
+        if pending._strip_tabs and not self._recovered_tabs:
+            # Preserve <<- semantics even within continued words and substitutions.
+            tail = '\n'.join(line.lstrip('\t') for line in self._text[self._pos :].split('\n'))
+            self._text = self._text[: self._pos] + tail
+            self._heredoc_ends = None
+            self._recovered_expansions = False
+            self._recovered_tabs = True
+        body = ''
+        expansions: tuple[SubstitutionPart, ...] = ()
+        if not self._recovered_body:
+            body = self._text[self._pos :]
+            self._recovered_body = True
+        if not pending._quoted and not self._recovered_expansions:
+            expansions = self._scan_heredoc_expansions(self._text[self._pos :])
+            self._recovered_expansions = True
+        return Heredoc(pending._delimiter, pending._quoted, body, expansions, body_inlined=True)
+
     def _drain_heredocs(self, state: _CommandState) -> None:
         """Attach pending bodies and their expansion trees to their segments."""
         for pending in state._pending:
+            if self._recover_heredocs and not self._has_heredoc_end(pending):
+                pending._elements[pending._index] = self._recover_heredoc(pending)
+                continue
             body = self._read_heredoc_body(pending)
             expansions = () if pending._quoted else self._scan_heredoc_expansions(body)
             pending._elements[pending._index] = Heredoc(
@@ -534,7 +580,7 @@ class _Parser:
     def _parse_operator(
         self,
         operator: str,
-        elements: list[_ELEMENT],
+        elements: list[_Element],
         state: _CommandState,
     ) -> None:
         """Record an operator and collect any heredoc delimiter it introduces."""
@@ -560,7 +606,7 @@ class _Parser:
 
     def _parse_segment(self, state: _CommandState) -> None:
         """Read one segment while preserving words, operators, and heredocs."""
-        elements: list[_ELEMENT] = []
+        elements: list[_Element] = []
         terminator: str | None = None
         while True:
             self._skip_blanks()
@@ -574,7 +620,7 @@ class _Parser:
                 terminator = '\n'
                 break
             if char == '#':
-                elements.append(Comment(self._read_to_line_end()))
+                elements.append(_Comment(self._read_to_line_end()))
                 continue
             operator = self._match_operator()
             if operator is None:
@@ -630,14 +676,17 @@ def _scan_balanced(text: str, start: int, opener: str, closer: str) -> int:
     return len(text)
 
 
-def parse_command(text: str) -> Command:
+def parse_command(text: str, *, recover_heredocs: bool = False) -> Command:
     """Parse shell command text into a total command tree.
 
     Args:
         text: Raw shell command text as the host delivered it.
+        recover_heredocs: For conservative detector script scans only, parse
+            unmatched heredoc bodies as following segments and share their
+            token and expansion tails instead of reparsing nested suffixes.
 
     Returns:
         The command tree. A parse that needed recovery lists its reasons in
         `Command.recovery`; the tree is never absent.
     """
-    return _Parser(text)._parse()
+    return _Parser(text, recover_heredocs=recover_heredocs)._parse()

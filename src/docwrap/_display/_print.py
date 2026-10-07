@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from docwrap._color import BOLD, GREEN, RED, colorize, visible_controls
+from docwrap._color import BOLD, GREEN, RED, colorize, path_text, visible_controls
 from docwrap._display._summary import format_summary
 from docwrap._types import DEFAULT_LINE_LENGTH
 
@@ -32,7 +32,7 @@ def _format_preview(results: list['FileResult'], *, color: bool = False) -> str:
             if not dc.changed and not show_skip_note:
                 continue
 
-            header = visible_controls(f'{r.path}:{dc.start_line}:{dc.qualname}')
+            header = visible_controls(f'{path_text(r.path)}:{dc.start_line}:{dc.qualname}')
             parts: list[str] = [colorize(header, BOLD) if color else header]
 
             # Skip diagnostic

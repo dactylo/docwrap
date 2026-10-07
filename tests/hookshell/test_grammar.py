@@ -1,8 +1,12 @@
+import shlex
 from pathlib import Path
 
 import pytest
 
-from docwrap._grammar import (
+from docwrap._vendor.hookshell import (
+    _grammar as _grammar_module,
+)
+from docwrap._vendor.hookshell._grammar import (
     _ELEMENT_RELATIVE_ROUTE,
     _ELEMENT_UNKNOWN_CWD,
     _HINT_ROUTE,
@@ -11,8 +15,9 @@ from docwrap._grammar import (
     Rejection,
     classify_grammar,
 )
-from docwrap._shellparse import parse_command
-from tests.helpers import shell_path
+from docwrap._vendor.hookshell._shellparse import (
+    parse_command,
+)
 
 
 def _grammar(text: str, cwd: Path | None) -> CommitPlan | NoCommit | Rejection:
@@ -36,6 +41,10 @@ def _plan(text: str, cwd: Path | None) -> CommitPlan:
     return result
 
 
+def _shell_path(path: Path) -> str:
+    return shlex.quote(path.as_posix())
+
+
 @pytest.fixture
 def routes(tmp_path: Path) -> Path:
     (tmp_path / 'repo').mkdir()
@@ -52,6 +61,16 @@ class TestEligibility:
             'calc+fast.py',
             'sp ace.py',
             '#tag.py',
+        )
+
+    def test_carriage_return_in_amend_date_is_rejected(self, routes: Path) -> None:
+        assert _element('GIT_COMMITTER_DATE="x\ry" git commit --amend -m x', routes) == (
+            'carriage return in \'GIT_COMMITTER_DATE="x\ry"\''
+        )
+
+    def test_carriage_return_in_route_is_rejected(self, routes: Path) -> None:
+        assert _element('git -C "./re\rpo" commit -m x', routes) == (
+            'carriage return in \'"./re\rpo"\''
         )
 
     def test_carriage_return_is_rejected(self, routes: Path) -> None:
@@ -71,7 +90,7 @@ class TestEligibility:
         def route_resolution_forbidden(*_args: object, **_kwargs: object) -> None:
             pytest.fail('carriage-return route reached route resolution')
 
-        monkeypatch.setattr('docwrap._grammar.resolve_route', route_resolution_forbidden)
+        monkeypatch.setattr(_grammar_module, 'resolve_route', route_resolution_forbidden)
         assert _element("git -C './a\rb' commit -m x", routes) == ("carriage return in ''./a\rb''")
 
     @pytest.mark.parametrize(
@@ -104,8 +123,50 @@ class TestEligibility:
     def test_recovered_tree_is_rejected_with_its_first_reason(self, routes: Path) -> None:
         assert _element("git commit -m 'x", routes) == 'unbalanced quotes'
 
+    @pytest.mark.parametrize('platform', ['win32', 'linux'])
+    @pytest.mark.parametrize(
+        'case',
+        [
+            ('/c', True),
+            ('/Z/repo', True),
+            ('/home/repo', False),
+            ('/1', False),
+            ('/c-file', False),
+            ('C:/repo', False),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'template',
+        ['git commit -m "{}"', 'git -C "{}" commit -m x', 'git add "{}" && git commit -m x'],
+    )
+    def test_windows_msys_word_boundary_and_diagnostic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        routes: Path,
+        case: tuple[str, bool],
+        *,
+        platform: str,
+        template: str,
+    ) -> None:
+        word, msys_path = case
+        monkeypatch.setattr('sys.platform', platform)
+        result = _grammar(template.format(word), routes)
+        if platform == 'win32' and msys_path:
+            assert isinstance(result, Rejection)
+            assert 'MSYS-style word' in result.element
+            assert word in result.element
+            assert 'Windows' in result.element
+            assert 'C:/...' in result.hint
+        else:
+            # Acceptance of the grammar does not establish that a route exists.
+            assert isinstance(result, (CommitPlan, NoCommit))
+
 
 class TestHeredocMessage:
+    def test_carriage_return_in_opaque_body_is_accepted(self, routes: Path) -> None:
+        idiom = 'git commit -m "$(cat <<\'EOF\'\nfeat: x\n\nbody\nEOF\n)"'
+        _plan(idiom.replace('feat: x', 'feat: x\ry'), routes)
+
     @pytest.mark.parametrize(
         ('delimiter_syntax', 'delimiter'),
         [
@@ -201,6 +262,10 @@ class TestAmendPrefix:
                 'GIT_COMMITTER_DATE=x git status',
                 "assignment 'GIT_COMMITTER_DATE=x'",
             ),
+            (
+                'git commit -m x; GIT_COMMITTER_DATE=x git status',
+                "assignment 'GIT_COMMITTER_DATE=x'",
+            ),
         ],
     )
     def test_rejected_prefixes(self, text: str, element: str, routes: Path) -> None:
@@ -223,6 +288,25 @@ class TestSequence:
     def test_missing_cd_target_is_a_proven_no_commit(self, routes: Path) -> None:
         _no_commit('cd ./missing && git commit -m x', routes)
 
+    def test_quoted_separator_route_is_a_directory_name(self, routes: Path) -> None:
+        plan = _plan("git -C ';' commit -m x", routes)
+        assert plan.cwd == str((routes / ';').resolve())
+
+    @pytest.mark.parametrize(
+        'text',
+        ['git -C /absolute/repo commit -m x', 'cd /absolute/repo && git commit -m x'],
+    )
+    def test_route_io_failure_is_rejected_with_routing_guidance(
+        self, text: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def inaccessible_route(*_args: object, **_kwargs: object) -> str:
+            raise PermissionError('route lookup denied')
+
+        monkeypatch.setattr(_grammar_module, 'resolve_route', inaccessible_route)
+        result = _grammar(text, None)
+        assert isinstance(result, Rejection)
+        assert result.hint == _HINT_ROUTE
+
     @pytest.mark.parametrize(
         'text',
         [
@@ -235,10 +319,6 @@ class TestSequence:
     )
     def test_separators(self, text: str, routes: Path) -> None:
         _plan(text, routes)
-
-    def test_quoted_separator_route_is_a_directory_name(self, routes: Path) -> None:
-        plan = _plan("git -C ';' commit -m x", routes)
-        assert plan.cwd == str((routes / ';').resolve())
 
     @pytest.mark.parametrize(
         ('text', 'element'),
@@ -290,6 +370,11 @@ class TestSequence:
 
 
 class TestReadOnly:
+    def test_diff_staged_matches_cached(self, routes: Path) -> None:
+        suffix = '&& git -C ./repo add a.py && git -C ./repo commit --dry-run -i a.py -m x'
+        _no_commit(f'git -C ./repo diff --staged {suffix}', routes)
+        _no_commit(f'git -C ./repo diff --cached {suffix}', routes)
+
     @pytest.mark.parametrize('observer', ['status --short', 'diff --check', 'log --oneline'])
     @pytest.mark.parametrize('position', ['before-add', 'after-add', 'without-add'])
     @pytest.mark.parametrize('separator', [' && ', '; ', '\n'])
@@ -311,11 +396,6 @@ class TestReadOnly:
         assert isinstance(result, Rejection)
         assert result.element == f'read-only git {observer.split(maxsplit=1)[0]} before git commit'
         assert 'separate tool call' in result.hint
-
-    def test_diff_staged_matches_cached(self, routes: Path) -> None:
-        suffix = '&& git -C ./repo add a.py && git -C ./repo commit --dry-run -i a.py -m x'
-        _no_commit(f'git -C ./repo diff --staged {suffix}', routes)
-        _no_commit(f'git -C ./repo diff --cached {suffix}', routes)
 
     @pytest.mark.parametrize(
         'option', ['--dry-run', '--short', '--porcelain', '--long', '--null', '-z']
@@ -339,6 +419,9 @@ class TestReadOnly:
         self, routes: Path, command: str
     ) -> None:
         _no_commit(command, routes)
+
+    def test_precheck_text_in_a_message_is_not_a_segment(self, routes: Path) -> None:
+        _plan("git commit -m 'git diff --check; git status && git log --oneline'", routes)
 
     @pytest.mark.parametrize(
         ('short_options', 'long_options'),
@@ -365,7 +448,7 @@ class TestReadOnly:
         'segment',
         [
             'git status',
-            'git status --short --branch --porcelain --porcelain=v1 --untracked-files=all -l',
+            'git status --short --branch --porcelain --porcelain=v1 --untracked-files=all',
             'git diff --cached --check --stat --name-only --name-status',
             'git log --oneline --stat --format=%H -3 -n 2',
             "git log -1 --format='%h %s'",
@@ -383,6 +466,7 @@ class TestReadOnly:
             ('git diff --cached --name-only --', "argument '--' on git diff"),
             ('git log --format %H', "option '--format' on git log"),
             ('git log -n x', "option '-n' on git log"),
+            ('git status -l', "option '-l' on git status"),
             ('git status -x', "option '-x' on git status"),
             ('git status -sbx', "option '-sbx' on git status"),
             ('git status -', "option '-' on git status"),
@@ -589,14 +673,14 @@ class TestCommitOptions:
 class TestUnknownDirectory:
     def test_absolute_cd_route_resolves_without_a_base(self, routes: Path) -> None:
         target = routes / 'repo'
-        plan = _plan(f'cd {shell_path(target)} && git add a.py && git commit -m x', None)
+        plan = _plan(f'cd {_shell_path(target)} && git add a.py && git commit -m x', None)
         assert plan.cwd == str(target)
         assert plan.pre_commit_adds[0].exec_cwd == str(target)
         assert plan.pre_commit_adds[0].git_cwd == str(target)
 
     def test_absolute_dash_c_route_replays_in_the_route(self, routes: Path) -> None:
         target = routes / 'repo'
-        route = shell_path(target)
+        route = _shell_path(target)
         plan = _plan(f'git -C {route} add a.py && git -C {route} commit -m x', None)
         assert plan.cwd == str(target.resolve())
         assert plan.pre_commit_adds[0].tokens == ('git', '-C', target.as_posix(), 'add', 'a.py')
@@ -604,7 +688,7 @@ class TestUnknownDirectory:
 
     def test_absolute_dash_c_with_known_directory_replays_there(self, routes: Path) -> None:
         target = routes / 'repo'
-        route = shell_path(target)
+        route = _shell_path(target)
         plan = _plan(f'git -C {route} add a.py && git -C {route} commit -m x', routes)
         assert plan.pre_commit_adds[0].exec_cwd == str(routes)
 
@@ -613,7 +697,7 @@ class TestUnknownDirectory:
         assert result == Rejection(_ELEMENT_UNKNOWN_CWD, _HINT_ROUTE)
 
     def test_missing_absolute_target_is_a_no_commit(self, routes: Path) -> None:
-        missing = shell_path(routes / 'missing')
+        missing = _shell_path(routes / 'missing')
         _no_commit(f'cd {missing} && git commit -m x', None)
         _no_commit(f'git -C {missing} commit -m x', None)
 

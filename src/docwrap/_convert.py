@@ -859,8 +859,6 @@ def _preserve_unsupported_sections(
         if target_style.uses_field_list_entries:
             return regions
         return _preserve_unmapped_sphinx_fields(regions, strip_types)
-    if not source_style.supports_section_headers:
-        return regions
 
     result: list[Region] = []
     index = 0

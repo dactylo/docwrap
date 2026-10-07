@@ -11,7 +11,7 @@ from docwrap._types import CanonicalRole, SectionKind, SphinxFieldRole, StyleNam
 
 _log = logging.getLogger(__name__)
 
-FIELD_ROLES = frozenset(
+_FIELD_ROLES = frozenset(
     {
         'cvar',
         'except',
@@ -33,11 +33,11 @@ FIELD_ROLES = frozenset(
     }
 )
 
-FIELD_MARKER_RE = re.compile(r'^\s*:(' + '|'.join(sorted(FIELD_ROLES)) + r')\b')
+FIELD_MARKER_RE = re.compile(r'^\s*:(' + '|'.join(sorted(_FIELD_ROLES)) + r')\b')
 
 # Matches  :role [type] [name]: description
 _FIELD_RE = re.compile(
-    r'^:(' + '|'.join(sorted(FIELD_ROLES)) + r')'
+    r'^:(' + '|'.join(sorted(_FIELD_ROLES)) + r')'
     r'(?:\s+(\S.*?))?'
     r':\s*(.*)',
 )
@@ -53,7 +53,7 @@ _ROLE_NORMALIZE: dict[str, str] = {
 
 
 class _SphinxStyle:
-    """Sphinx/reST-style docstring style."""
+    """Parse and format reST field-list entries."""
 
     name: StyleName = 'sphinx'
     canonical_to_field: Mapping[CanonicalRole, SphinxFieldRole] = {
@@ -220,6 +220,18 @@ class _SphinxStyle:
         """
         return []
 
+    def is_conservative_entry_candidate(self, content: str) -> bool:
+        """Leave Sphinx field detection to the normal matcher.
+
+        Args:
+            content: Unused line content after the entry indentation.
+
+        Returns:
+            `False` because Sphinx needs no conservative check.
+        """
+        del content
+        return False
+
     def is_section_header(
         self,
         line: str,  # noqa: ARG002
@@ -257,7 +269,7 @@ class _SphinxStyle:
         if m is None:
             return None
         leading_ws = len(line) - len(line.lstrip())
-        # _FIELD_RE constrains the role to FIELD_ROLES, which after
+        # _FIELD_RE constrains the role to _FIELD_ROLES, which after
         # _ROLE_NORMALIZE collapses to the SphinxFieldRole alphabet.
         role = cast('SphinxFieldRole', _ROLE_NORMALIZE.get(m.group(1), m.group(1)))
         middle = m.group(2) or ''
@@ -281,16 +293,6 @@ class _SphinxStyle:
                     role=role,
                     description_start=desc_start,
                 )
-            return EntryMatch(
-                name=middle.strip(),
-                type_ann='',
-                description=desc,
-                role=role,
-                description_start=desc_start,
-            )
-
-        # :type name: type_str  /  :rtype: type_str
-        if role in ('type', 'vartype', 'rtype'):
             return EntryMatch(
                 name=middle.strip(),
                 type_ann='',

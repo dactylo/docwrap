@@ -3,7 +3,7 @@ import tomllib
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TextIO, get_type_hints
+from typing import TextIO, get_type_hints
 from unittest.mock import patch
 
 import pytest
@@ -53,110 +53,6 @@ class TestAllowOnFailureConfig:
         assert hook_cfg.allow_on_failure is True
 
 
-class TestCachedTomlSharing:
-    @pytest.mark.parametrize('first_lookup', ['incremental', 'full'])
-    @pytest.mark.parametrize('file_exists', [True, False])
-    def test_file_and_directory_inputs_share_toml_cache(
-        self,
-        tmp_path: Path,
-        first_lookup: str,
-        *,
-        file_exists: bool,
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\n'
-            'color = "always"\n'
-            'incremental = "file"\n'
-            'style = "google"\n'
-            '[tool.docwrap.stats]\n'
-            'sections = ["impact"]\n'
-        )
-        incremental_path = tmp_path / 'incremental.py'
-        full_path = tmp_path / 'full.py'
-        if file_exists:
-            incremental_path.write_text('pass\n')
-            full_path.write_text('pass\n')
-
-        with patch.object(tomllib, 'load', wraps=tomllib.load) as load:
-            if first_lookup == 'incremental':
-                incremental = find_incremental_config(incremental_path)
-                full = find_config(full_path)
-            else:
-                full = find_config(full_path)
-                incremental = find_incremental_config(incremental_path)
-            stats = find_stats_config(tmp_path)
-            color = find_color_config(tmp_path)
-
-        assert incremental == 'file'
-        assert full.config.style == 'google'
-        assert stats.sections == ('impact',)
-        assert color == 'always'
-        assert load.call_count == 1
-
-    def test_shares_toml_cache_with_find_config(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\ncolor = "always"\nstyle = "google"\n'
-        )
-        monkeypatch.chdir(tmp_path)
-        config_mod._find_config_cached.cache_clear()
-        config_mod._load_tool_table.cache_clear()
-
-        original_load = tomllib.load
-        call_count = 0
-
-        def tracking_load(
-            *args: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-            **kwargs: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-        ) -> dict[str, Any]:
-            nonlocal call_count
-            call_count += 1
-            return original_load(*args, **kwargs)
-
-        monkeypatch.setattr(tomllib, 'load', tracking_load)
-
-        color = find_color_config(tmp_path)
-        assert color == 'always'
-
-        cfg = resolve_config(tmp_path / 'dummy.py')
-        assert cfg.style == 'google'
-
-        # tomllib.load should be called exactly once -- the second call
-        # hits the _load_tool_table cache
-        assert call_count == 1
-
-    def test_stats_and_wrap_config_share_toml_cache(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\nstyle = "google"\n[tool.docwrap.stats]\nsections = ["impact"]\n'
-        )
-        config_mod._find_config_cached.cache_clear()
-        config_mod._find_stats_config_cached.cache_clear()
-        config_mod._load_tool_table.cache_clear()
-
-        original_load = tomllib.load
-        call_count = 0
-
-        def tracking_load(
-            *args: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-            **kwargs: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-        ) -> dict[str, Any]:
-            nonlocal call_count
-            call_count += 1
-            return original_load(*args, **kwargs)
-
-        monkeypatch.setattr(tomllib, 'load', tracking_load)
-
-        wrap_config = resolve_config(tmp_path / 'dummy.py')
-        stats_config = find_stats_config(tmp_path)
-
-        assert wrap_config.style == 'google'
-        assert stats_config.sections == ('impact',)
-        assert call_count == 1
-
-
 class TestColorConfig:
     def test_color_always(self, tmp_path: Path) -> None:
         (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\ncolor = "always"\n')
@@ -187,30 +83,18 @@ class TestColorConfig:
 
 
 class TestConfigCache:
-    def test_clear_also_drops_the_parsed_tool_table(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_clear_also_drops_the_parsed_tool_table(self, tmp_path: Path) -> None:
         clear_config_cache()
         pyproject = tmp_path / 'pyproject.toml'
         pyproject.write_text('[tool.docwrap]\nline-length = 100\n', encoding='utf-8')
         resolve_config(tmp_path / 'mod.py')
 
-        original_load = tomllib.load
-        calls = 0
+        with patch.object(tomllib, 'load', wraps=tomllib.load) as load:
+            pyproject.write_text('[tool.docwrap]\nline-length = 120\n', encoding='utf-8')
+            clear_config_cache()
+            assert resolve_config(tmp_path / 'mod.py').line_length == 120
 
-        def counting_load(
-            *args: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-            **kwargs: Any,  # noqa: ANN401 - Preserve `tomllib.load`'s open `parse_float` boundary.
-        ) -> dict[str, Any]:
-            nonlocal calls
-            calls += 1
-            return original_load(*args, **kwargs)
-
-        monkeypatch.setattr(tomllib, 'load', counting_load)
-        pyproject.write_text('[tool.docwrap]\nline-length = 120\n', encoding='utf-8')
-        clear_config_cache()
-        assert resolve_config(tmp_path / 'mod.py').line_length == 120
-        assert calls == 1
+        assert load.call_count == 1
 
     def test_clear_config_cache_picks_up_edits(self, tmp_path: Path) -> None:
         clear_config_cache()
@@ -407,97 +291,6 @@ class TestFindColorConfig:
             assert find_color_config(tmp_path) == 'never'
 
 
-class TestIncrementalConfig:
-    def test_find_config_includes_incremental(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "file"\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        resolved = find_config(f)
-        assert resolved.incremental == 'file'
-
-    @pytest.mark.parametrize(
-        'toml',
-        [
-            '[tool.docwrap]\n',
-            '[tool.docwrap]\nincremental = "bogus"\n',
-            '[tool.docwrap]\nincremental = 1\n',
-        ],
-    )
-    def test_find_incremental_config_defaults_silently(
-        self,
-        tmp_path: Path,
-        toml: str,
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(toml)
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', DocwrapConfigWarning)
-            assert find_incremental_config(tmp_path) is None
-
-    def test_find_incremental_config_ignores_other_invalid_fields(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\n'
-            'incremental = "docstring"\n'
-            'style = "bogus"\n'
-            'color = "rainbow"\n'
-            'line-length = 0\n'
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', DocwrapConfigWarning)
-            assert find_incremental_config(tmp_path) == 'docstring'
-
-    @pytest.mark.parametrize(
-        ('toml_value', 'expected'),
-        [
-            ('"file"', 'file'),
-            ('"definition"', 'definition'),
-            ('"docstring"', 'docstring'),
-            ('true', 'definition'),
-            ('false', False),
-        ],
-    )
-    def test_find_incremental_config_reads_valid_values(
-        self, tmp_path: Path, toml_value: str, expected: object
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(f'[tool.docwrap]\nincremental = {toml_value}\n')
-        assert find_incremental_config(tmp_path) == expected
-
-    def test_incremental_default_none(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental is None
-
-    def test_incremental_definition(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "definition"\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental == 'definition'
-
-    def test_incremental_docstring(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "docstring"\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental == 'docstring'
-
-    def test_incremental_false(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = false\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental is False
-
-    def test_incremental_file(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "file"\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental == 'file'
-
-    def test_incremental_invalid_warns(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "bogus"\n')
-        with pytest.warns(DocwrapConfigWarning, match='bogus'):
-            resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental is None
-
-    def test_incremental_true_becomes_definition(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = true\n')
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.incremental == 'definition'
-
-
 class TestLineLength:
     def test_default_fallback(self, tmp_path: Path) -> None:
         cfg = find_config(tmp_path / 'test.py').config
@@ -523,42 +316,6 @@ class TestLineLengthSource:
         f.write_text('')
         resolved = find_config(f)
         assert resolved.line_length_source is LineLengthSource.DOCWRAP
-
-
-class TestMalformedConfig:
-    @pytest.mark.parametrize(
-        ('toml_value', 'invalid_value'),
-        [('true', True), ('"eighty"', 'eighty'), ('0', 0), ('-1', -1)],
-    )
-    def test_invalid_line_length_warns_and_uses_default(
-        self,
-        tmp_path: Path,
-        toml_value: str,
-        invalid_value: object,
-    ) -> None:
-        toml = tmp_path / 'pyproject.toml'
-        toml.write_text(f'[tool.docwrap]\nline-length = {toml_value}\n')
-        match = rf'invalid \[tool\.docwrap\]\.line-length value {invalid_value!r}'
-        with pytest.warns(DocwrapConfigWarning, match=match):
-            resolved = find_config(tmp_path / 'test.py')
-        assert resolved.config.line_length == DEFAULT_LINE_LENGTH
-        assert resolved.line_length_source is LineLengthSource.DEFAULT
-
-    def test_malformed_toml_warns_and_uses_defaults(self, tmp_path: Path) -> None:
-        toml = tmp_path / 'pyproject.toml'
-        toml.write_text('this is not valid toml [[[')
-        with pytest.warns(DocwrapConfigWarning, match='pyproject.toml'):
-            cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.line_length == DEFAULT_LINE_LENGTH
-        assert cfg.style is None
-
-    def test_missing_line_length_is_silent(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', DocwrapConfigWarning)
-            resolved = find_config(tmp_path / 'test.py')
-        assert resolved.config.line_length == DEFAULT_LINE_LENGTH
-        assert resolved.line_length_source is LineLengthSource.DEFAULT
 
 
 class TestNonUtf8Pyproject:
@@ -679,6 +436,438 @@ class TestRenderConfigWarnings:
 
         with pytest.raises(OSError, match='boom'), render_config_warnings():
             warn_then_fail()
+
+
+class TestResolveConfig:
+    def test_accepts_string_path(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(str(f))
+        assert isinstance(cfg, DocwrapConfig)
+
+    def test_defaults(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.line_length == DEFAULT_LINE_LENGTH
+        assert cfg.style is None
+
+    def test_reads_convention_as_style(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nconvention = "numpy"\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.style == 'numpy'
+
+    def test_reads_line_length(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 100\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.line_length == 100
+
+    def test_style_key(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nstyle = "google"\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.style == 'google'
+
+    def test_style_wins_over_convention(self, tmp_path: Path) -> None:
+        toml = '[tool.docwrap]\nconvention = "numpy"\nstyle = "google"\n'
+        (tmp_path / 'pyproject.toml').write_text(toml)
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.style == 'google'
+
+    def test_type_hints_resolvable(self) -> None:
+        hints = get_type_hints(resolve_config)
+        assert 'path' in hints
+
+
+class TestResolveConfigPathForms:
+    def test_existing_directory_starts_discovery_at_itself(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
+        assert resolve_config(tmp_path).line_length == 60
+
+    def test_nonexistent_file_starts_discovery_at_parent(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
+        assert resolve_config(tmp_path / 'does_not_exist.py').line_length == 60
+
+    def test_resolved_config_accepted_by_all_public_operations(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
+        f = tmp_path / 'mod.py'
+        f.write_text('def foo():\n    """Short."""\n')
+        cfg = resolve_config(f)
+        assert docwrap.wrap_source('x = 1\n', config=cfg) == 'x = 1\n'
+        assert docwrap.wrap_source_report('x = 1\n', config=cfg).total == 0
+        assert docwrap.check('x = 1\n', config=cfg).status == 'unchanged'
+        assert docwrap.wrap_file_report(f, config=cfg).total == 1
+
+    def test_str_and_pathlike_accepted(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
+        assert resolve_config(str(tmp_path / 'mod.py')).line_length == 60
+        assert resolve_config(tmp_path / 'mod.py').line_length == 60
+
+
+class TestResolvedConfig:
+    def test_composes_transformation_and_operational_settings(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\n'
+            'line-length = 100\n'
+            'color = "never"\n'
+            'incremental = "docstring"\n'
+            'show-skips = true\n'
+            'allow-on-failure = true\n'
+        )
+        resolved = find_config(tmp_path / 'test.py')
+        assert isinstance(resolved, ResolvedConfig)
+        assert resolved.config.line_length == 100
+        assert resolved.color == 'never'
+        assert resolved.incremental == 'docstring'
+        assert resolved.show_skips is True
+        assert resolved.allow_on_failure is True
+        assert resolved.line_length_source is LineLengthSource.DOCWRAP
+
+    def test_defaults_without_configuration(self, tmp_path: Path) -> None:
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.config == DocwrapConfig()
+        assert resolved.allow_on_failure is False
+        assert resolved.color == 'auto'
+        assert resolved.incremental is None
+        assert resolved.line_length_source is LineLengthSource.DEFAULT
+        assert resolved.show_skips is False
+
+    def test_resolve_config_returns_transformation_component(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 100\n')
+        assert resolve_config(tmp_path / 'test.py') == find_config(tmp_path / 'test.py').config
+
+
+class TestSummaryStartConfig:
+    def test_invalid_summary_start_warns_and_defaults(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "middle"\n')
+        with pytest.warns(DocwrapConfigWarning, match='summary-start'):
+            cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.summary_start == 'preserve'
+
+    def test_resolve_config_includes_summary_start(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "second-line"\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.summary_start == 'second-line'
+
+    def test_summary_start_default(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.summary_start == 'preserve'
+
+    def test_summary_start_first_line(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "first-line"\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.summary_start == 'first-line'
+
+    def test_summary_start_preserve(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "preserve"\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.summary_start == 'preserve'
+
+    def test_summary_start_second_line(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "second-line"\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.summary_start == 'second-line'
+
+
+class TestWalkBoundary:
+    def test_git_file_stops_the_walk(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
+        )
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        (repo / '.git').write_text('gitdir: /elsewhere\n', encoding='utf-8')
+        nested = repo / 'src'
+        nested.mkdir()
+        assert resolve_config(nested / 'mod.py').line_length != 100
+
+    def test_git_root_pyproject_is_found(self, tmp_path: Path) -> None:
+        (tmp_path / '.git').mkdir()
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
+        )
+        nested = tmp_path / 'src' / 'pkg'
+        nested.mkdir(parents=True)
+        assert resolve_config(nested / 'mod.py').line_length == 100
+
+    def test_no_git_anywhere_walks_to_root(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
+        )
+        nested = tmp_path / 'a' / 'b'
+        nested.mkdir(parents=True)
+        assert resolve_config(nested / 'mod.py').line_length == 100
+
+    def test_pyproject_above_git_root_is_ignored(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
+        )
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        (repo / '.git').mkdir()
+        nested = repo / 'src'
+        nested.mkdir()
+        assert resolve_config(nested / 'mod.py').line_length != 100
+
+
+class TestWalkUp:
+    def test_finds_parent_toml(self, tmp_path: Path) -> None:
+        toml = tmp_path / 'pyproject.toml'
+        toml.write_text('[tool.docwrap]\nline-length = 99\n')
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        cfg = find_config(subdir / 'test.py').config
+        assert cfg.line_length == 99
+
+
+class TestWrapSummaryConfig:
+    def test_invalid_wrap_summary_warns_and_defaults(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = "yes"\n')
+        with pytest.warns(DocwrapConfigWarning, match='wrap-summary'):
+            cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.wrap_summary is False
+
+    def test_resolve_config_includes_wrap_summary(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = true\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        cfg = resolve_config(f)
+        assert cfg.wrap_summary is True
+
+    def test_wrap_summary_default(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.wrap_summary is False
+
+    def test_wrap_summary_false(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = false\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.wrap_summary is False
+
+    def test_wrap_summary_true(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = true\n')
+        cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.wrap_summary is True
+
+
+@pytest.fixture(autouse=True)  # noqa: V103
+def clear_config_cache_between_tests() -> Iterator[None]:
+    clear_config_cache()
+    yield
+    clear_config_cache()
+
+
+class TestCachedTomlSharing:
+    @pytest.mark.parametrize('first_lookup', ['incremental', 'full'])
+    @pytest.mark.parametrize('file_exists', [True, False])
+    def test_file_and_directory_inputs_share_toml_cache(
+        self,
+        tmp_path: Path,
+        first_lookup: str,
+        *,
+        file_exists: bool,
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\n'
+            'color = "always"\n'
+            'incremental = "file"\n'
+            'style = "google"\n'
+            '[tool.docwrap.stats]\n'
+            'sections = ["impact"]\n'
+        )
+        incremental_path = tmp_path / 'incremental.py'
+        full_path = tmp_path / 'full.py'
+        if file_exists:
+            incremental_path.write_text('pass\n')
+            full_path.write_text('pass\n')
+
+        with patch.object(tomllib, 'load', wraps=tomllib.load) as load:
+            if first_lookup == 'incremental':
+                incremental = find_incremental_config(incremental_path)
+                full = find_config(full_path)
+            else:
+                full = find_config(full_path)
+                incremental = find_incremental_config(incremental_path)
+            stats = find_stats_config(tmp_path)
+            color = find_color_config(tmp_path)
+
+        assert incremental == 'file'
+        assert full.config.style == 'google'
+        assert stats.sections == ('impact',)
+        assert color == 'always'
+        assert load.call_count == 1
+
+    def test_shares_toml_cache_with_find_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\ncolor = "always"\nstyle = "google"\n'
+        )
+        monkeypatch.chdir(tmp_path)
+        config_mod._find_config_cached.cache_clear()
+        config_mod._load_tool_table.cache_clear()
+
+        with patch.object(tomllib, 'load', wraps=tomllib.load) as load:
+            color = find_color_config(tmp_path)
+            cfg = resolve_config(tmp_path / 'dummy.py')
+
+        assert color == 'always'
+        assert cfg.style == 'google'
+        # The second lookup uses the parsed tool-table cache.
+        assert load.call_count == 1
+
+    def test_stats_and_wrap_config_share_toml_cache(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nstyle = "google"\n[tool.docwrap.stats]\nsections = ["impact"]\n'
+        )
+        config_mod._find_config_cached.cache_clear()
+        config_mod._find_stats_config_cached.cache_clear()
+        config_mod._load_tool_table.cache_clear()
+
+        with patch.object(tomllib, 'load', wraps=tomllib.load) as load:
+            wrap_config = resolve_config(tmp_path / 'dummy.py')
+            stats_config = find_stats_config(tmp_path)
+
+        assert wrap_config.style == 'google'
+        assert stats_config.sections == ('impact',)
+        assert load.call_count == 1
+
+
+class TestIncrementalConfig:
+    def test_find_config_includes_incremental(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "file"\n')
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+        resolved = find_config(f)
+        assert resolved.incremental == 'file'
+
+    @pytest.mark.parametrize(
+        'toml',
+        [
+            '[tool.docwrap]\n',
+            '[tool.docwrap]\nincremental = "bogus"\n',
+            '[tool.docwrap]\nincremental = 1\n',
+        ],
+    )
+    def test_find_incremental_config_defaults_silently(
+        self,
+        tmp_path: Path,
+        toml: str,
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(toml)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DocwrapConfigWarning)
+            assert find_incremental_config(tmp_path) is None
+
+    def test_find_incremental_config_ignores_other_invalid_fields(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\n'
+            'incremental = "docstring"\n'
+            'style = "bogus"\n'
+            'color = "rainbow"\n'
+            'line-length = 0\n'
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DocwrapConfigWarning)
+            assert find_incremental_config(tmp_path) == 'docstring'
+
+    @pytest.mark.parametrize(
+        ('toml_value', 'expected'),
+        [
+            ('"file"', 'file'),
+            ('"definition"', 'definition'),
+            ('"docstring"', 'docstring'),
+            ('true', 'definition'),
+            ('false', False),
+        ],
+    )
+    def test_find_incremental_config_reads_valid_values(
+        self, tmp_path: Path, toml_value: str, expected: object
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(f'[tool.docwrap]\nincremental = {toml_value}\n')
+        assert find_incremental_config(tmp_path) == expected
+
+    def test_incremental_default_none(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental is None
+
+    def test_incremental_definition(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "definition"\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental == 'definition'
+
+    def test_incremental_docstring(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "docstring"\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental == 'docstring'
+
+    def test_incremental_false(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = false\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental is False
+
+    def test_incremental_file(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "file"\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental == 'file'
+
+    def test_incremental_invalid_warns(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = "bogus"\n')
+        with pytest.warns(DocwrapConfigWarning, match='bogus'):
+            resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental is None
+
+    def test_incremental_true_becomes_definition(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nincremental = true\n')
+        resolved = find_config(tmp_path / 'test.py')
+        assert resolved.incremental == 'definition'
+
+
+class TestMalformedConfig:
+    @pytest.mark.parametrize(
+        ('toml_value', 'invalid_value'),
+        [('true', True), ('"eighty"', 'eighty'), ('0', 0), ('-1', -1)],
+    )
+    def test_invalid_line_length_warns_and_uses_default(
+        self,
+        tmp_path: Path,
+        toml_value: str,
+        invalid_value: object,
+    ) -> None:
+        toml = tmp_path / 'pyproject.toml'
+        toml.write_text(f'[tool.docwrap]\nline-length = {toml_value}\n')
+        match = rf'invalid \[tool\.docwrap\]\.line-length value {invalid_value!r}'
+        with pytest.warns(DocwrapConfigWarning, match=match):
+            resolved = find_config(tmp_path / 'test.py')
+        assert resolved.config.line_length == DEFAULT_LINE_LENGTH
+        assert resolved.line_length_source is LineLengthSource.DEFAULT
+
+    def test_malformed_toml_warns_and_uses_defaults(self, tmp_path: Path) -> None:
+        toml = tmp_path / 'pyproject.toml'
+        toml.write_text('this is not valid toml [[[')
+        with pytest.warns(DocwrapConfigWarning, match='pyproject.toml'):
+            cfg = find_config(tmp_path / 'test.py').config
+        assert cfg.line_length == DEFAULT_LINE_LENGTH
+        assert cfg.style is None
+
+    def test_missing_line_length_is_silent(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DocwrapConfigWarning)
+            resolved = find_config(tmp_path / 'test.py')
+        assert resolved.config.line_length == DEFAULT_LINE_LENGTH
+        assert resolved.line_length_source is LineLengthSource.DEFAULT
 
 
 class TestResolutionWarningContract:
@@ -842,112 +1031,6 @@ class TestResolutionWarningContract:
         finally:
             pyproject.chmod(0o644)
         assert cfg == DocwrapConfig()
-
-
-class TestResolveConfig:
-    def test_accepts_string_path(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(str(f))
-        assert isinstance(cfg, DocwrapConfig)
-
-    def test_defaults(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.line_length == DEFAULT_LINE_LENGTH
-        assert cfg.style is None
-
-    def test_reads_convention_as_style(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nconvention = "numpy"\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.style == 'numpy'
-
-    def test_reads_line_length(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 100\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.line_length == 100
-
-    def test_style_key(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nstyle = "google"\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.style == 'google'
-
-    def test_style_wins_over_convention(self, tmp_path: Path) -> None:
-        toml = '[tool.docwrap]\nconvention = "numpy"\nstyle = "google"\n'
-        (tmp_path / 'pyproject.toml').write_text(toml)
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.style == 'google'
-
-    def test_type_hints_resolvable(self) -> None:
-        hints = get_type_hints(resolve_config)
-        assert 'path' in hints
-
-
-class TestResolveConfigPathForms:
-    def test_existing_directory_starts_discovery_at_itself(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
-        assert resolve_config(tmp_path).line_length == 60
-
-    def test_nonexistent_file_starts_discovery_at_parent(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
-        assert resolve_config(tmp_path / 'does_not_exist.py').line_length == 60
-
-    def test_resolved_config_accepted_by_all_public_operations(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
-        f = tmp_path / 'mod.py'
-        f.write_text('def foo():\n    """Short."""\n')
-        cfg = resolve_config(f)
-        assert docwrap.wrap_source('x = 1\n', config=cfg) == 'x = 1\n'
-        assert docwrap.wrap_source_report('x = 1\n', config=cfg).total == 0
-        assert docwrap.check('x = 1\n', config=cfg).status == 'unchanged'
-        assert docwrap.wrap_file_report(f, config=cfg).total == 1
-
-    def test_str_and_pathlike_accepted(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 60\n')
-        assert resolve_config(str(tmp_path / 'mod.py')).line_length == 60
-        assert resolve_config(tmp_path / 'mod.py').line_length == 60
-
-
-class TestResolvedConfig:
-    def test_composes_transformation_and_operational_settings(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\n'
-            'line-length = 100\n'
-            'color = "never"\n'
-            'incremental = "docstring"\n'
-            'show-skips = true\n'
-            'allow-on-failure = true\n'
-        )
-        resolved = find_config(tmp_path / 'test.py')
-        assert isinstance(resolved, ResolvedConfig)
-        assert resolved.config.line_length == 100
-        assert resolved.color == 'never'
-        assert resolved.incremental == 'docstring'
-        assert resolved.show_skips is True
-        assert resolved.allow_on_failure is True
-        assert resolved.line_length_source is LineLengthSource.DOCWRAP
-
-    def test_defaults_without_configuration(self, tmp_path: Path) -> None:
-        resolved = find_config(tmp_path / 'test.py')
-        assert resolved.config == DocwrapConfig()
-        assert resolved.allow_on_failure is False
-        assert resolved.color == 'auto'
-        assert resolved.incremental is None
-        assert resolved.line_length_source is LineLengthSource.DEFAULT
-        assert resolved.show_skips is False
-
-    def test_resolve_config_returns_transformation_component(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nline-length = 100\n')
-        assert resolve_config(tmp_path / 'test.py') == find_config(tmp_path / 'test.py').config
 
 
 class TestShowSkipsConfig:
@@ -1149,126 +1232,3 @@ class TestStatsConfig:
         cfg = find_stats_config(tmp_path)
 
         assert cfg.longest_per_category == 7
-
-
-class TestSummaryStartConfig:
-    def test_invalid_summary_start_warns_and_defaults(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "middle"\n')
-        with pytest.warns(DocwrapConfigWarning, match='summary-start'):
-            cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.summary_start == 'preserve'
-
-    def test_resolve_config_includes_summary_start(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "second-line"\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.summary_start == 'second-line'
-
-    def test_summary_start_default(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.summary_start == 'preserve'
-
-    def test_summary_start_first_line(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "first-line"\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.summary_start == 'first-line'
-
-    def test_summary_start_preserve(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "preserve"\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.summary_start == 'preserve'
-
-    def test_summary_start_second_line(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nsummary-start = "second-line"\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.summary_start == 'second-line'
-
-
-class TestWalkBoundary:
-    def test_git_file_stops_the_walk(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
-        )
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        (repo / '.git').write_text('gitdir: /elsewhere\n', encoding='utf-8')
-        nested = repo / 'src'
-        nested.mkdir()
-        assert resolve_config(nested / 'mod.py').line_length != 100
-
-    def test_git_root_pyproject_is_found(self, tmp_path: Path) -> None:
-        (tmp_path / '.git').mkdir()
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
-        )
-        nested = tmp_path / 'src' / 'pkg'
-        nested.mkdir(parents=True)
-        assert resolve_config(nested / 'mod.py').line_length == 100
-
-    def test_no_git_anywhere_walks_to_root(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
-        )
-        nested = tmp_path / 'a' / 'b'
-        nested.mkdir(parents=True)
-        assert resolve_config(nested / 'mod.py').line_length == 100
-
-    def test_pyproject_above_git_root_is_ignored(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.docwrap]\nline-length = 100\n', encoding='utf-8'
-        )
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        (repo / '.git').mkdir()
-        nested = repo / 'src'
-        nested.mkdir()
-        assert resolve_config(nested / 'mod.py').line_length != 100
-
-
-class TestWalkUp:
-    def test_finds_parent_toml(self, tmp_path: Path) -> None:
-        toml = tmp_path / 'pyproject.toml'
-        toml.write_text('[tool.docwrap]\nline-length = 99\n')
-        subdir = tmp_path / 'sub'
-        subdir.mkdir()
-        cfg = find_config(subdir / 'test.py').config
-        assert cfg.line_length == 99
-
-
-class TestWrapSummaryConfig:
-    def test_invalid_wrap_summary_warns_and_defaults(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = "yes"\n')
-        with pytest.warns(DocwrapConfigWarning, match='wrap-summary'):
-            cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.wrap_summary is False
-
-    def test_resolve_config_includes_wrap_summary(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = true\n')
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-        cfg = resolve_config(f)
-        assert cfg.wrap_summary is True
-
-    def test_wrap_summary_default(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.wrap_summary is False
-
-    def test_wrap_summary_false(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = false\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.wrap_summary is False
-
-    def test_wrap_summary_true(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.docwrap]\nwrap-summary = true\n')
-        cfg = find_config(tmp_path / 'test.py').config
-        assert cfg.wrap_summary is True
-
-
-@pytest.fixture(autouse=True)  # noqa: V103
-def clear_config_cache_between_tests() -> Iterator[None]:
-    clear_config_cache()
-    yield
-    clear_config_cache()

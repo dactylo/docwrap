@@ -3,7 +3,7 @@
 import difflib
 from collections.abc import Iterator
 
-from docwrap._color import BOLD, GREEN, RED, colorize, visible_controls
+from docwrap._color import BOLD, GREEN, RED, colorize, path_text, visible_controls
 
 
 def _colorize_diff_line(line: str) -> str:
@@ -36,6 +36,7 @@ def iter_diff(
     path: str,
     *,
     color: bool,
+    terminal: bool = False,
 ) -> Iterator[str]:
     """Generate unified diff output with optional colorization.
 
@@ -44,13 +45,14 @@ def iter_diff(
         result: Modified text.
         path: File path for diff header.
         color: Whether to apply ANSI color codes.
+        terminal: Whether to use human-facing path separators in the header.
 
     Yields:
         Visible-control-safe unified diff lines, optionally colorized.
     """
     source_lines = _split_physical_lines(source)
     result_lines = _split_physical_lines(result)
-    visible_path = visible_controls(str(path))
+    visible_path = visible_controls(path_text(path) if terminal else str(path))
     diff = difflib.unified_diff(
         source_lines,
         result_lines,

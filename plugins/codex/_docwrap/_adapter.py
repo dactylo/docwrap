@@ -54,11 +54,16 @@ def _permission_deny(reason: str, stderr_prefix: str = '') -> HostResponse:
 
 
 class CodexAdapter:
-    """Translate Codex `PreToolUse` and `PostToolUse` payloads."""
+    """Translate Codex PreToolUse and PostToolUse payloads.
+
+    Call `parse()` before `render()` on the same instance. Parsing each payload
+    replaces the event context used to choose the response format.
+    """
 
     name = 'codex'
     api_version = API_VERSION
     requires_event = False
+    _post_tool = False
 
     def parse(self, payload: Mapping[str, object], event: str | None) -> HostInput | None:
         """Read `hook_event_name`, `tool_name`, `tool_input`, and `cwd`.
@@ -76,6 +81,7 @@ class CodexAdapter:
             `None`. Post-tool paths come from the `apply_patch` command text.
         """
         del event
+        self._post_tool = False
         hook_event = payload.get('hook_event_name')
         tool_name = payload.get('tool_name')
         tool_input = object_field(payload, 'tool_input')
@@ -84,22 +90,27 @@ class CodexAdapter:
             command = tool_input.get('command') if tool_name == 'Bash' else None
             return HostInput('pre_tool', command if isinstance(command, str) else None, cwd, None)
         if hook_event == 'PostToolUse':
+            self._post_tool = True
             command = tool_input.get('command') if tool_name == _EDIT_TOOL else None
             paths = _apply_patch_paths(command) if isinstance(command, str) else ()
             return HostInput('post_tool', None, cwd, None, paths)
         return None
 
     def render(self, result: HookResult) -> HostResponse:
-        """Render allow feedback or a denial.
+        """Render feedback using the event recorded by `parse()`.
 
         Args:
             result: Decision, reason, and notes from docwrap.
 
         Returns:
-            Empty stdout for a silent allow, or one system message for allow
-            feedback; notes on stderr and exit 0. For deny, the deny JSON on
-            stdout, the reason on stderr, and exit 0.
+            For pre-tool input, empty stdout for a silent allow, a system
+            message for allow feedback, or deny JSON with the denial reason on
+            stderr. For post-tool input, distinct nonempty diagnostic lines as
+            additional context, or empty stdout when there are none.
+            Notes remain on stderr and the exit status is 0.
         """
+        if self._post_tool:
+            return _post_tool_response(result)
         notes = notes_text(result)
         if result.decision == 'deny':
             return _permission_deny(result.reason or 'docwrap denied the operation', notes)
@@ -115,3 +126,17 @@ class CodexAdapter:
             The deny JSON on stdout, the reason on stderr, and exit 0.
         """
         return _permission_deny(reason)
+
+
+def _post_tool_response(result: HookResult) -> HostResponse:
+    """Render distinct diagnostic lines as post-tool context."""
+    lines = '\n'.join((*result.notes, result.reason or '')).split('\n')
+    context = '\n'.join(dict.fromkeys(line for line in lines if line))
+    payload = {
+        'hookSpecificOutput': {
+            'hookEventName': 'PostToolUse',
+            'additionalContext': context,
+        },
+    }
+    stdout = f'{json.dumps(payload)}\n' if context else ''
+    return HostResponse(stdout, notes_text(result), 0)

@@ -1,4 +1,5 @@
 import configparser
+import json
 import os
 import shutil
 import sys
@@ -6,6 +7,7 @@ import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -13,6 +15,11 @@ from _build import PluginMetadataHook
 from tests.helpers import BUILTIN_ENTRY_POINTS, process_transcript, run_cli, run_setup
 
 _ROOT = Path(__file__).resolve().parents[1]
+_MARKETPLACES = (
+    _ROOT / '.agents' / 'plugins' / 'marketplace.json',
+    _ROOT / '.claude-plugin' / 'marketplace.json',
+)
+_PLUGINS = _ROOT / 'plugins'
 
 
 def _build(project: Path, target: str) -> Path:
@@ -40,12 +47,36 @@ def _copy_project(destination: Path) -> None:
             )
 
 
+def _declared_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for manifest in sorted(_PLUGINS.rglob('plugin.json')):
+        data = cast('dict[str, object]', json.loads(manifest.read_text(encoding='utf-8')))
+        if 'version' in data:
+            versions[manifest.relative_to(_ROOT).as_posix()] = cast('str', data['version'])
+    for marketplace in _MARKETPLACES:
+        data = cast('dict[str, object]', json.loads(marketplace.read_text(encoding='utf-8')))
+        entries = cast('list[dict[str, object]]', data['plugins'])
+        for index, entry in enumerate(entries):
+            if 'version' in entry:
+                key = f'{marketplace.relative_to(_ROOT).as_posix()}:plugins[{index}]'
+                versions[key] = cast('str', entry['version'])
+    return versions
+
+
 def _entry_points(wheel: Path) -> dict[str, str]:
     with zipfile.ZipFile(wheel) as archive:
         metadata = next(name for name in archive.namelist() if name.endswith('/entry_points.txt'))
         config = configparser.ConfigParser()
         config.read_string(archive.read(metadata).decode())
     return dict(config['docwrap.hook_adapters'])
+
+
+def test_declared_versions_match_package_version() -> None:
+    with (_ROOT / 'pyproject.toml').open('rb') as stream:
+        package_version = cast('str', tomllib.load(stream)['project']['version'])
+    versions = _declared_versions()
+    assert versions
+    assert versions == dict.fromkeys(versions, package_version)
 
 
 def test_duplicate_plugin_registration_fails_the_metadata_build(tmp_path: Path) -> None:

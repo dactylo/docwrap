@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 
-from docwrap._cli import _build_hook_parser
+from docwrap._hook_front import _build_hook_parser
 from docwrap._hosts import load_adapter
 from docwrap.hooks import API_VERSION, HookAdapter, HookResult, HostInput, HostResponse
 from plugins.agy._docwrap._adapter import AntigravityAdapter

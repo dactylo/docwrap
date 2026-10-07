@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from docwrap._styles import EntryMatch, get_style
-from docwrap._styles._google import GoogleStyle, _compile_entry_re
+from docwrap._styles._google import _compile_entry_re, _GoogleStyle
 from docwrap._types import CanonicalRole
 
 FALLBACK_ANNOTATION_CASES = (
@@ -50,7 +50,7 @@ class TestCanonicalSections:
 
 class TestClassification:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_args_is_entry(self) -> None:
         assert self.style.classify_section('Args') == 'entry'
@@ -84,13 +84,19 @@ class TestClassification:
     def test_returns_prose_by_default(self) -> None:
         assert self.style.classify_section('Returns') == 'prose'
 
+    def test_wide_return_union_is_prose(self) -> None:
+        line = '    ' + ' | '.join(['int'] * 1000) + ': Result.'
+
+        assert self.style.classify_section('Returns', (line,)) == 'prose'
+        assert self.style.match_entry(line, role='returns') is None
+
     def test_yields_entry_when_body_matches(self) -> None:
         assert self.style.classify_section('Yields', ('    str: Each line.',)) == 'entry'
 
 
 class TestEntryMatching:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_double_star_kwargs(self) -> None:
         match = self.style.match_entry('    **kwargs: Keyword args.')
@@ -190,7 +196,7 @@ class TestEntryMatching:
 
 class TestFormatEntry:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_param_empty_description(self) -> None:
         em = EntryMatch(name='x', type_ann='int', description='')
@@ -233,12 +239,11 @@ class TestFormatEntry:
         em = EntryMatch(name='int', type_ann='', description='The count.')
         result = self.style.format_entry(em, 'returns', strip_types=True)
         assert result == ['    The count.']
-        assert ':' not in result[0] or 'The count.' in result[0].split(':', 1)[0] is False
 
 
 class TestMultiNameSplit:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_multi_name_param_expands_to_reparseable_entries(
         self,
@@ -310,7 +315,7 @@ class TestMultiNameSplit:
 
 class TestSectionHeaders:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_all_known_headers_recognized(self) -> None:
         for header in self.style.known_headers:
@@ -343,7 +348,7 @@ class TestSectionHeaders:
 
 class TestTargetRoleSupport:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     @pytest.mark.parametrize(
         'role',

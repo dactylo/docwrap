@@ -1,3 +1,8 @@
+from pathlib import PureWindowsPath
+
+import pytest
+
+from docwrap import _color
 from docwrap._color import BOLD, GREEN, RED, RESET
 from docwrap._display._diff import iter_diff
 
@@ -67,3 +72,15 @@ class TestVisibleControls:
         assert f'{BOLD}--- test.py{RESET}\n' in output
         assert f'{RED}-old\\x1b{RESET}\n' in output
         assert f'{GREEN}+new\\x9b{RESET}\n' in output
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_windows_diff_path_preserves_redirected_output(
+    terminal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_color, 'PurePath', PureWindowsPath)
+    output = ''.join(
+        iter_diff('old\n', 'new\n', r'C:\repo\file.py', color=False, terminal=terminal)
+    )
+    expected = 'C:/repo/file.py' if terminal else r'C:\repo\file.py'
+    assert output.startswith(f'--- {expected}\n')

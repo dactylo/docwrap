@@ -1,4 +1,4 @@
-"""Public data types for the docwrap library API."""
+"""Shared data types for the library, CLI, and hook."""
 
 import enum
 from dataclasses import dataclass
@@ -110,7 +110,7 @@ class BaselineStatus(enum.Enum):
 class BaselineResult:
     """Per-file result of a git-index baseline read.
 
-    Args:
+    Attributes:
         status: Disposition of the read.
         content: Decoded source text (only when status is CONTENT).
         encoding: Detected encoding (defaults to utf-8).
@@ -127,7 +127,7 @@ class BaselineResult:
 class DocstringChange:
     """Information about a single docstring's wrapping result.
 
-    Args:
+    Attributes:
         qualname: Qualified name of the docstring owner (e.g. "Cls.method").
         start_line: Starting line number of the docstring.
         end_line: Ending line number of the docstring.
@@ -175,7 +175,7 @@ class DocstringChange:
 class DocstringSkip:
     """Safety/losslessness record for a docstring left unchanged.
 
-    Args:
+    Attributes:
         path: File path when known, or an empty string for in-memory sources.
         line: 1-based source line of the docstring literal, or 0 for file-level
             records.
@@ -198,7 +198,7 @@ class DocstringSkip:
 class DocwrapConfig:
     """Public configuration type for docwrap.
 
-    Args:
+    Attributes:
         convert: Target style for conversion, or None to skip conversion.
         fill_style: Filling algorithm used to select line breaks.
         line_length: Maximum line length for wrapping.
@@ -247,6 +247,35 @@ class DocwrapConfig:
         validate_config(self)
 
 
+@dataclass(slots=True)
+class FileResult:
+    """Per-file processing result used by CLI output formatting.
+
+    Attributes:
+        status: Exit code for this file (0 unchanged or written, 1 changes
+            pending, 2 error).
+        path: File path.
+        line_length: Effective line length used for wrapping.
+        total: Total number of docstrings found, or None when no report was
+            produced.
+        wrapped: Number of docstrings that were wrapped.
+        skipped_summaries: Number of docstrings whose summary wrapping was
+            skipped.
+        docstrings: Per-docstring change details retained for preview output.
+        show_skips: Whether preview output should show skipped-summary
+            diagnostics.
+    """
+
+    status: int
+    path: Path
+    line_length: int | None = None
+    total: int | None = None
+    wrapped: int = 0
+    skipped_summaries: int = 0
+    docstrings: tuple[DocstringChange, ...] = ()
+    show_skips: bool = False
+
+
 class LineLengthSource(enum.StrEnum):
     """Provenance label for the resolved line length.
 
@@ -262,28 +291,13 @@ class LineLengthSource(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class PreCommitAdd:
-    """Parsed Git add command that precedes a commit.
-
-    Args:
-        tokens: Parsed arguments for the Git add command.
-        exec_cwd: Directory in which the command segment executes.
-        git_cwd: Directory Git uses after applying any `-C` option.
-    """
-
-    tokens: tuple[str, ...]
-    exec_cwd: str
-    git_cwd: str
-
-
-@dataclass(frozen=True, slots=True)
 class WorktreeWrapContext:
     """Bundle of state passed through pre-tool-use hook handlers.
 
     Internal to the hook layer; not part of the public library API (omitted
     from __all__).
 
-    Args:
+    Attributes:
         repo_root: Absolute path to the Git worktree root.
         incr_level: Resolved incremental level, or `None` when disabled.
         allow_on_failure: Whether a wrapping failure permits the operation.
@@ -297,7 +311,7 @@ class WorktreeWrapContext:
 class WorktreeWrite(NamedTuple):
     """Prepared working-tree file write.
 
-    Args:
+    Attributes:
         path: File path to update.
         source: Transformed source text.
         encoding: Encoding to use for the write.
@@ -314,7 +328,7 @@ class WorktreeWrite(NamedTuple):
 class WrapCheckResult:
     """Result of a non-mutating wrap check.
 
-    Args:
+    Attributes:
         status: 'changed', 'unchanged', or 'invalid'.
         skips: Safety-skip records observed during the check.
     """
@@ -330,7 +344,7 @@ class WrapOverrides:
     Internal to the CLI layer; not part of the public library API (omitted from
     __all__).
 
-    Args:
+    Attributes:
         line_length: Maximum line length override.
         style: Docstring style override.
         convert: Target conversion style override.
@@ -359,7 +373,7 @@ class WrapOverrides:
 class WrapReport:
     """Result of wrapping, containing transformed source and metadata.
 
-    Args:
+    Attributes:
         source: The transformed source code.
         total: Total number of docstrings found.
         wrapped: Number of docstrings that were wrapped.
@@ -393,31 +407,3 @@ class WrapReport:
             is zero.
         """
         return (self.wrapped / self.total * 100) if self.total else 0.0
-
-
-@dataclass(slots=True)
-class FileResult:
-    """Per-file processing result used by CLI output formatting.
-
-    Args:
-        status: Exit code for this file (0 unchanged, 1 changed, 2 error).
-        path: File path.
-        line_length: Effective line length used for wrapping.
-        total: Total number of docstrings found, or None when no report was
-            produced.
-        wrapped: Number of docstrings that were wrapped.
-        skipped_summaries: Number of docstrings whose summary wrapping was
-            skipped.
-        docstrings: Per-docstring change details retained for preview output.
-        show_skips: Whether preview output should show skipped-summary
-            diagnostics.
-    """
-
-    status: int
-    path: Path
-    line_length: int | None = None
-    total: int | None = None
-    wrapped: int = 0
-    skipped_summaries: int = 0
-    docstrings: tuple[DocstringChange, ...] = ()
-    show_skips: bool = False

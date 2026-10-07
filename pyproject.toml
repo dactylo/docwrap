@@ -3,16 +3,15 @@
 # ==========================================================
 [build-system]
 build-backend = "hatchling.build"
-requires = [ "editables~=0.3", "hatchling>=1.27" ]
+requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27" ]
 
 # ==========================================================
 # Project Metadata
 # ==========================================================
 [project]
 name = "docwrap"
-version = "0.1.0"
+version = "0.2.0"
 description = "Wrap Python docstrings with support for Google, NumPy, and Sphinx styles"
-readme = "README.md"
 keywords = [ "docstring", "formatter", "google", "numpy", "sphinx", "wrap" ]
 license = "MIT"
 license-files = [ "LICENSE" ]
@@ -24,12 +23,12 @@ classifiers = [
   "Programming Language :: Python :: 3.15",
   "Typing :: Typed",
 ]
-dynamic = [ "entry-points" ]
+dynamic = [ "entry-points", "readme" ]
 urls.Documentation = "https://github.com/dactylo/docwrap/tree/main/docs"
 urls.Homepage = "https://github.com/dactylo/docwrap"
 urls.Issues = "https://github.com/dactylo/docwrap/issues"
 urls.Repository = "https://github.com/dactylo/docwrap"
-scripts.docwrap = "docwrap._cli:main"
+scripts.docwrap = "docwrap._main:main"
 
 [dependency-groups]
 dev = [
@@ -48,6 +47,7 @@ dev = [
   { include-group = "test" },
 ]
 test = [
+  "hypothesis",
   "pytest",
   "pytest-xdist>=3.2",
 ]
@@ -59,8 +59,21 @@ ci-build = [
 [tool.hatch]
 metadata.hooks.custom.path = "_build.py"
 build.targets.wheel.include = [ "/plugins/*/_docwrap/", "/src/docwrap/" ]
-build.targets.sdist.include = [ "/_build.py", "/plugins", "/src" ]
+build.targets.sdist.include = [ "/README.md", "/_build.py", "/plugins", "/src" ]
 build.targets.wheel.sources = [ "src" ]
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+fragments = [ { path = "README.md" } ]
+
+# Keep checkout links relative; package links target this release.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(!\[[^\]\n]*\]\()(?![A-Za-z][A-Za-z0-9+.-]*:|[/#])(?:\./)?([^\s)]+)(\))'
+replacement = '\1https://raw.githubusercontent.com/dactylo/docwrap/v$HFPR_VERSION/\2\3'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?<!!)(\[[^\]\n]+\]\()(?![A-Za-z][A-Za-z0-9+.-]*:|[/#])(?:\./)?([^\s)]+)(\))'
+replacement = '\1https://github.com/dactylo/docwrap/blob/v$HFPR_VERSION/\2\3'
 
 [tool.uv]
 # CI supplies the native Taplo CLI; its Python package lacks Linux/Windows ARM wheels.
@@ -81,26 +94,20 @@ lint.select = [ "ALL" ]
 lint.ignore = [
   "COM812", # Conflicts with the Ruff formatter
   "CPY001", # Copyright notices are not required
-  "D203",   # Conflicts with the Google docstring convention
-  "D213",   # Conflicts with the Google docstring convention
   "EM101",  # Exception must not use string literal
   "EM102",  # Exception must not use f-string literal
   "FBT001", # Boolean positional arg in function definition
   "FBT002", # Boolean default value in function definition
-  "ISC001", # Implicit string concatenation
   "Q000",   # Conflicts with the Ruff formatter
-  "Q001",   # Conflicts with the Ruff formatter
-  "Q002",   # Conflicts with the Ruff formatter
   "Q003",   # Conflicts with the Ruff formatter
   "T201",   # print() found
   "TRY003", # Avoid specifying long messages outside exception class
 ]
 # Same-file private-member collaboration follows the module privacy boundary.
-lint.per-file-ignores."src/docwrap/_grammar.py" = [ "SLF001" ]
-lint.per-file-ignores."src/docwrap/_shellparse.py" = [ "SLF001" ]
+lint.per-file-ignores."src/docwrap/_vendor/hookshell/_grammar.py" = [ "SLF001" ]
+lint.per-file-ignores."src/docwrap/_vendor/hookshell/_shellparse.py" = [ "SLF001" ]
 lint.per-file-ignores."{tests,plugins/*/tests}/**/*.py" = [
   "D",       # No docstrings required in tests
-  "PLC2701", # Tests intentionally import private implementation symbols
   "PLR2004", # Allow magic values in tests
   "S101",    # Allow asserts in tests
   "S603",    # Allow subprocess calls in tests
@@ -116,17 +123,12 @@ lint.pydocstyle.convention = "google"
 [tool.vulture]
 ignore_names = [
   "_enable_hook",
-  "_enable_wrap_summary",
-  "_isolate_git_config",  # Autouse pytest fixture
-  "commenters",
+  "_isolate_git_config", # Autouse pytest fixture
   "median",
   "p75",
   "p90",
   "p95",
   "p99",
-  "sphinx_field",
-  "whitespace_split",
-  "wordchars",
 ]
 
 [tool.pyproject-fmt]
@@ -152,6 +154,7 @@ ini_options.testpaths = [ "plugins", "tests" ]
 ini_options.pythonpath = [ ".", "src" ]
 ini_options.addopts = [ "-q", "--strict-markers", "--tb=short" ]
 ini_options.markers = [ "slow: marks tests as slow (deselect with '-m \"not slow\"')" ]
+ini_options.faulthandler_timeout = 300
 
 # ==========================================================
 # Mdformat Configuration (Requires mdformat-pyproject)

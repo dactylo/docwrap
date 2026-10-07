@@ -1,9 +1,9 @@
 """Columnar formatting for the default CLI summary display."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-from docwrap._color import BOLD, colorize, severity_color, visible_controls
+from docwrap._color import BOLD, colorize, path_text, severity_color, visible_controls
 
 if TYPE_CHECKING:
     from docwrap._types import FileResult
@@ -23,6 +23,16 @@ class _SummaryAggregates:
     show_total: bool
 
 
+class _SummaryRow(NamedTuple):
+    """Display path and counts for one included file."""
+
+    path: str
+    skipped: int
+    wrapped: int
+    total: int
+    changed: bool
+
+
 @dataclass(frozen=True, slots=True)
 class _SummaryWidths:
     """Column widths for format_summary."""
@@ -34,11 +44,9 @@ class _SummaryWidths:
     pct_w: int
 
 
-def _collect_summary_rows(
-    results: list['FileResult'], *, verbose: bool
-) -> list[tuple[str, int, int, int, bool]]:
-    """Pass 1: collect (path, skip, wrapped, total, changed) tuples from results."""
-    rows: list[tuple[str, int, int, int, bool]] = []
+def _collect_summary_rows(results: list['FileResult'], *, verbose: bool) -> list[_SummaryRow]:
+    """Select display rows from file results."""
+    rows: list[_SummaryRow] = []
     for r in results:
         total = r.total
         if total is None:
@@ -48,12 +56,12 @@ def _collect_summary_rows(
         if not changed and not (verbose and (has_skips or total > 0)):
             continue
         rows.append(
-            (
-                visible_controls(str(r.path)),
-                r.skipped_summaries,
-                r.wrapped,
-                total,
-                changed,
+            _SummaryRow(
+                path=visible_controls(path_text(str(r.path))),
+                skipped=r.skipped_summaries,
+                wrapped=r.wrapped,
+                total=total,
+                changed=changed,
             )
         )
     return rows
@@ -78,13 +86,13 @@ def _colorize_pct_row(
 
 
 def _compute_summary_aggregates(
-    rows: list[tuple[str, int, int, int, bool]],
+    rows: list[_SummaryRow],
 ) -> _SummaryAggregates:
-    """Pass 2: compute TOTAL row values from all displayed rows."""
-    n_changed = sum(1 for _, _, _, _, ch in rows if ch)
-    agg_skip = sum(s for _, s, _, _, _ in rows)
-    agg_wrapped = sum(w for _, _, w, _, _ in rows)
-    agg_total = sum(t for _, _, _, t, _ in rows)
+    """Compute TOTAL values from all displayed rows."""
+    n_changed = sum(row.changed for row in rows)
+    agg_skip = sum(row.skipped for row in rows)
+    agg_wrapped = sum(row.wrapped for row in rows)
+    agg_total = sum(row.total for row in rows)
     return _SummaryAggregates(
         n_changed=n_changed,
         agg_skip=agg_skip,
@@ -126,19 +134,19 @@ def _pct_str(wrapped: int, total: int) -> str:
 
 
 def _compute_summary_widths(
-    rows: list[tuple[str, int, int, int, bool]],
+    rows: list[_SummaryRow],
     aggs: _SummaryAggregates,
 ) -> _SummaryWidths:
-    """Pass 3: compute column widths for the summary table."""
-    name_w = max(len(_HEADERS[0]), *(len(p) for p, _, _, _, _ in rows))
+    """Size columns to fit displayed rows and the optional TOTAL row."""
+    name_w = max(len(_HEADERS[0]), *(len(row.path) for row in rows))
     if aggs.show_total:
         name_w = max(name_w, len('TOTAL'))
-    skip_w = max(len(_HEADERS[1]), *(len(str(s)) for _, s, _, _, _ in rows))
-    tot_w = max(len(_HEADERS[2]), *(len(str(t)) for _, _, _, t, _ in rows))
-    wrapped_w = max(len(_HEADERS[3]), *(len(str(w)) for _, _, w, _, _ in rows))
+    skip_w = max(len(_HEADERS[1]), *(len(str(row.skipped)) for row in rows))
+    tot_w = max(len(_HEADERS[2]), *(len(str(row.total)) for row in rows))
+    wrapped_w = max(len(_HEADERS[3]), *(len(str(row.wrapped)) for row in rows))
     pct_w = max(
         len(_HEADERS[4]),
-        *(len(_pct_str(w, t)) for _, _, w, t, _ in rows),
+        *(len(_pct_str(row.wrapped, row.total)) for row in rows),
     )
     if aggs.show_total:
         skip_w = max(skip_w, len(str(aggs.agg_skip)))
@@ -155,24 +163,29 @@ def _compute_summary_widths(
 
 
 def _format_summary_lines(
-    rows: list[tuple[str, int, int, int, bool]],
+    rows: list[_SummaryRow],
     aggs: _SummaryAggregates,
     widths: _SummaryWidths,
     *,
     color: bool,
 ) -> str:
-    """Pass 4: format header + body rows + optional TOTAL row."""
+    """Render the header, file rows, and optional TOTAL row."""
     header_line = _format_summary_row(*_HEADERS, widths=widths)
     if color:
         header_line = colorize(header_line, BOLD)
     lines = [header_line]
-    for path_str, skip, wrapped, total, _ in rows:
-        pct = _pct_str(wrapped, total)
+    for item in rows:
+        pct = _pct_str(item.wrapped, item.total)
         row = _format_summary_row(
-            path_str, str(skip), str(total), str(wrapped), pct, widths=widths
+            item.path,
+            str(item.skipped),
+            str(item.total),
+            str(item.wrapped),
+            pct,
+            widths=widths,
         )
         if color:
-            row = _colorize_pct_row(row, pct, 1 if wrapped > 0 else 0, name=path_str)
+            row = _colorize_pct_row(row, pct, 1 if item.wrapped > 0 else 0, name=item.path)
         lines.append(row)
     if aggs.show_total:
         agg_pct = _pct_str(aggs.agg_wrapped, aggs.agg_total)

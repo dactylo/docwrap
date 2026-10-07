@@ -9,12 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from docwrap._detector import is_git_executable
-from docwrap._shell import is_msys_mount_path, normalize_msys_path, resolve_route
-from docwrap._shellparse import (
+from ._detector import is_git_executable
+from ._shell import is_msys_mount_path, normalize_msys_path, resolve_route
+from ._shellparse import (
     NAME_CHARACTERS,
     NAME_START,
-    WORD_PART,
     Command,
     ExpansionPart,
     GlobPart,
@@ -24,10 +23,10 @@ from docwrap._shellparse import (
     Segment,
     SubstitutionPart,
     Word,
+    WordPart,
 )
-from docwrap._types import PreCommitAdd
 
-_ADD_SELECTORS = frozenset({'-A', '-u', '--all', '--update'})
+ADD_SELECTORS = frozenset({'-A', '-u', '--all', '--update'})
 _AMEND_DATE_COMMAND = ('git', 'log', '-1', '--format=%aI')
 _ASSIGNMENT_NAME = 'GIT_COMMITTER_DATE'
 _CD_SEGMENT_SIZE = 2
@@ -133,16 +132,31 @@ _READ_ONLY_OPTIONS = {
     ),
     'log': frozenset({'--oneline', '--stat'}),
     'status': frozenset(
-        {'--branch', '--porcelain', '--porcelain=v1', '--short', '--untracked-files=all', '-l'}
+        {'--branch', '--porcelain', '--porcelain=v1', '--short', '--untracked-files=all'}
     ),
 }
 _SEQUENCE_TERMINATORS = frozenset({'&&', ';', '\n'})
 
 
+@dataclass(frozen=True, slots=True)
+class PreCommitAdd:
+    """Parsed Git add command that precedes a commit.
+
+    Attributes:
+        tokens: Parsed arguments for the Git add command.
+        exec_cwd: Directory in which the command segment executes.
+        git_cwd: Git working directory after `-C` or `cd` routing.
+    """
+
+    tokens: tuple[str, ...]
+    exec_cwd: str
+    git_cwd: str
+
+
 class CommitMode(NamedTuple):
     """Selection state of an accepted `git commit` command.
 
-    Args:
+    Attributes:
         auto_stage: Whether the commit stages tracked changes automatically.
         include: Whether named paths are staged in addition to the index.
         only: Whether only named paths are committed.
@@ -163,7 +177,7 @@ class CommitMode(NamedTuple):
 class CommitPlan:
     """Accepted command that will create a commit, resolved to its execution directory.
 
-    Args:
+    Attributes:
         cwd: Established directory in which Git runs the commit. It is never a
             substituted session or process directory.
         mode: Selection state of the commit.
@@ -184,7 +198,7 @@ class NoCommit:
 class Rejection:
     """First unsupported element of a command and the nearest accepted form.
 
-    Args:
+    Attributes:
         element: Short phrase naming the unsupported element.
         hint: Nearest accepted form.
     """
@@ -235,7 +249,7 @@ class _GitSegment(NamedTuple):
     commit: _CommitState | None = None
 
 
-def _amend_value_accepted(rest: str, remaining: Sequence[WORD_PART]) -> bool:
+def _amend_value_accepted(rest: str, remaining: Sequence[WordPart]) -> bool:
     """Return whether an assignment value is literal or the exact log substitution."""
     if all(isinstance(part, LiteralPart) for part in remaining):
         return True
@@ -347,28 +361,26 @@ def _amend_prefix(word: Word) -> bool | Rejection:
     assignment = _assignment_name(word)
     if assignment is None:
         return False
-    if '\r' in (word.literal_text or ''):
-        return Rejection(f"carriage return in '{_fragment(word.raw)}'", _HINT_SEQUENCE)
     name, rest = assignment
     if name == _ASSIGNMENT_NAME and _amend_value_accepted(rest, word.parts[1:]):
         return True
     return Rejection(f"assignment '{_fragment(word.raw)}'", _HINT_SEQUENCE)
 
 
-def _git_route(words: Sequence[Word]) -> tuple[str | None, int] | Rejection | None:
-    """Return a `-C` route, a carriage-return rejection, or `None`."""
+def _carriage_return(words: Sequence[Word]) -> Rejection | None:
+    """Reject carriage returns in literal words without inspecting opaque bodies."""
+    for word in words:
+        if '\r' in (word.literal_text or ''):
+            return Rejection(f"carriage return in '{_fragment(word.raw)}'", _HINT_SEQUENCE)
+    return None
+
+
+def _git_route(words: Sequence[Word]) -> tuple[str | None, int] | None:
+    """Return the `-C` route and the subcommand index, or `None` for a malformed `-C`."""
     if len(words) > 1 and words[1].literal_text == '-C':
-        if len(words) <= _GIT_ROUTE_INDEX:
-            return None
-        route_word = words[_GIT_ROUTE_INDEX]
-        route = route_word.literal_text
+        route = words[_GIT_ROUTE_INDEX].literal_text if len(words) > _GIT_ROUTE_INDEX else None
         if not route:
             return None
-        if '\r' in route:
-            return Rejection(
-                f"carriage return in '{_fragment(route_word.raw)}'",
-                _HINT_SEQUENCE,
-            )
         return route, 3
     return None, 1
 
@@ -382,7 +394,7 @@ def _parse_add(texts: Sequence[str]) -> Rejection | None:
     """Check a `git add` segment against the closed add forms."""
     if not texts:
         return Rejection('git add without pathspec', _HINT_ADD)
-    selector = texts[0] in _ADD_SELECTORS
+    selector = texts[0] in ADD_SELECTORS
     index = 1 if selector else 0
     options_ended = index < len(texts) and texts[index] == '--'
     if options_ended:
@@ -552,8 +564,6 @@ def _literal_texts(words: Sequence[Word], hint: str) -> tuple[str, ...] | Reject
         text = word.literal_text
         if text is None:
             return _reject_word(word, hint)
-        if '\r' in text:
-            return Rejection(f"carriage return in '{_fragment(word.raw)}'", hint)
         texts.append(text)
     return tuple(texts)
 
@@ -561,9 +571,6 @@ def _literal_texts(words: Sequence[Word], hint: str) -> tuple[str, ...] | Reject
 def _parse_commit(words: Sequence[Word]) -> _CommitState | Rejection:
     """Parse the words after `git commit` against the option inventory."""
     state = _CommitState()
-    for word in words:
-        if '\r' in (word.literal_text or ''):
-            return Rejection(f"carriage return in '{_fragment(word.raw)}'", _HINT_COMMIT)
     index = 0
     while index < len(words):
         word = words[index]
@@ -633,7 +640,10 @@ def _resolve_plan(
     else:
         if command_cwd is None and not _is_absolute_route(route):
             return Rejection(_ELEMENT_RELATIVE_ROUTE, _HINT_ROUTE)
-        resolved = resolve_route(route, command_cwd, logical=cd_route is not None)
+        try:
+            resolved = resolve_route(route, command_cwd, logical=cd_route is not None)
+        except (OSError, ValueError):
+            return Rejection('unresolvable directory route', _HINT_ROUTE)
         if resolved is None:
             return NoCommit()
         cwd = resolved
@@ -670,7 +680,7 @@ def _segment_words(segment: Segment) -> tuple[Word, ...] | Rejection:
             return Rejection('comment', _HINT_SEQUENCE)
     if not words:
         return Rejection('empty segment', _HINT_SEQUENCE)
-    return tuple(words)
+    return _carriage_return(words) or tuple(words)
 
 
 def _word_text(word: Word) -> str:
@@ -721,15 +731,19 @@ def _parse_git_segment(segment: Segment, *, final: bool) -> _GitSegment | Reject
     if prefix:
         words = words[1:]
     segment_rejection = Rejection(f"segment '{text}'", _HINT_SEQUENCE)
-    is_git = bool(words) and words[0].literal_text == 'git' and not _has_msys_path(words)
+    is_git = bool(words) and words[0].literal_text == 'git'
     first_text = words[0].literal_text if words else None
     if first_text is not None and first_text != 'git' and is_git_executable(first_text):
         segment_rejection = Rejection(f"executable '{_fragment(first_text)}'", _HINT_EXECUTABLE)
         is_git = False
+    if is_git and _has_msys_path(words):
+        segment_rejection = Rejection(
+            f"MSYS-style word in Windows git segment '{text}'",
+            'Windows git segments reject /<letter> and /<letter>/... words; '
+            'use native Windows spelling such as C:/... for paths',
+        )
+        is_git = False
     routing = _git_route(words) if is_git else None
-    if isinstance(routing, Rejection):
-        segment_rejection = routing
-        routing = None
     if routing is None:
         return segment_rejection
     route, index = routing

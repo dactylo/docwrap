@@ -10,10 +10,10 @@ from docwrap._core._parse import Region, is_structural_underline, parse_regions
 from docwrap._core._process import wrap_source, wrap_source_report
 from docwrap._detect import detect_style
 from docwrap._styles import get_style
-from docwrap._styles._google import GoogleStyle
-from docwrap._styles._numpy import NumpyStyle
+from docwrap._styles._google import _GoogleStyle
+from docwrap._styles._numpy import _NumpyStyle
 from docwrap._styles._sphinx import (
-    FIELD_ROLES,
+    _FIELD_ROLES,
     _SphinxStyle,
 )
 from docwrap._types import CanonicalRole, DocwrapConfig, RegionKind, StyleName
@@ -78,7 +78,7 @@ class TestCodeBlockPreservation:
 
 class TestGoogleEntrySections:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_args_section(self) -> None:
         content = textwrap.dedent("""\
@@ -186,7 +186,7 @@ class TestGoogleEntrySections:
 
 class TestGoogleMultipleSections:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_args_and_returns(self) -> None:
         content = textwrap.dedent("""\
@@ -204,7 +204,7 @@ class TestGoogleMultipleSections:
 
 class TestGoogleProseSections:
     def setup_method(self) -> None:
-        self.style = GoogleStyle()
+        self.style = _GoogleStyle()
 
     def test_note_section(self) -> None:
         content = textwrap.dedent("""\
@@ -333,7 +333,7 @@ class TestNoSummary:
         assert regions[0].kind == 'code_block'
 
     def test_section_header_without_summary(self) -> None:
-        style = GoogleStyle()
+        style = _GoogleStyle()
         content = 'Args:\n    x: val.'
         regions = parse_regions(content, style=style, code_block_lines=set())
         assert regions[0].kind != 'blank'
@@ -341,7 +341,7 @@ class TestNoSummary:
 
 class TestNumpyCompoundTypeEntries:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_compound_type_with_multiple_entries(self) -> None:
         content = textwrap.dedent("""\
@@ -389,7 +389,7 @@ class TestNumpyCompoundTypeEntries:
 
 class TestNumpyEntrySections:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_dashed_underline_consumed(self) -> None:
         content = textwrap.dedent("""\
@@ -619,7 +619,7 @@ class TestOriginalLines:
                 \"\"\"
         """)
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         assert [(region.kind, region.original_lines) for region in results[0].regions] == [
             ('summary', ('Summary.',)),
             ('blank', ('',)),
@@ -638,7 +638,7 @@ class TestOriginalLines:
                 \"\"\"
         """)
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         entry_regions = [r for r in results[0].regions if r.kind == 'entry']
         assert len(entry_regions) == 1
         assert entry_regions[0].original_lines == (
@@ -656,7 +656,7 @@ class TestOriginalLines:
                 \"\"\"
         """)
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         list_regions = [r for r in results[0].regions if r.kind == 'list_item']
         assert len(list_regions) == 1
         assert list_regions[0].original_lines == (
@@ -674,7 +674,7 @@ class TestOriginalLines:
                 \"\"\"
         """)
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         desc_regions = [r for r in results[0].regions if r.kind == 'description']
         assert len(desc_regions) == 1
         original = desc_regions[0].original_lines
@@ -889,7 +889,7 @@ class TestSectionExit:
             '    """\n'
         )
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         kinds = [r.kind for r in results[0].regions]
         # The note should be 'description', not 'prose'
         assert 'description' in kinds
@@ -907,7 +907,7 @@ class TestSectionExit:
             '    """\n'
         )
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         # After normalization, "Note about x continued." is at indent 4 (relative
         # to body). That is >= section_body_indent (4), so it stays as prose.
         prose_regions = [r for r in results[0].regions if r.kind == 'prose']
@@ -928,7 +928,7 @@ class TestSectionExit:
             '    """\n'
         )
         docstrings = find_docstrings(source)
-        results = parse_docstrings(source, docstrings, DocwrapConfig())
+        results = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         entry_regions = [r for r in results[0].regions if r.kind == 'entry']
         # Both x and y should be entries (not descriptions)
         assert len(entry_regions) == 2
@@ -974,7 +974,7 @@ class TestSphinxFieldLists:
     def setup_method(self) -> None:
         self.style = _SphinxStyle()
 
-    @pytest.mark.parametrize('raw_role', sorted(FIELD_ROLES))
+    @pytest.mark.parametrize('raw_role', sorted(_FIELD_ROLES))
     def test_deeper_field_roles_remain_continuations(self, raw_role: str) -> None:
         field_line = _sphinx_field_line(raw_role)
         content = f'Summary.\n\n:param value: Lead.\n {field_line}'
@@ -1083,7 +1083,7 @@ class TestSphinxFieldLists:
 
 class TestSummaryAndDescription:
     def test_d205_inserts_blank_before_section(self) -> None:
-        style = GoogleStyle()
+        style = _GoogleStyle()
         content = 'Summary.\nArgs:\n    x: val.'
         regions = parse_regions(content, style=style, code_block_lines=set())
         kinds = [r.kind for r in regions]
@@ -1125,7 +1125,7 @@ class TestSummaryAndDescription:
 
 class TestSummaryNotFalsePositive:
     def test_numpy_bare_word_summary(self) -> None:
-        style = NumpyStyle()
+        style = _NumpyStyle()
         content = 'Summary.\n\nParameters\n----------\nx : int\n    A param.'
         regions = parse_regions(content, style=style, code_block_lines=set())
         assert regions[0].kind == 'summary'

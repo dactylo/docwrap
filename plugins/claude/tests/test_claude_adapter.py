@@ -8,8 +8,7 @@ from typing import Literal
 
 import pytest
 
-from docwrap._cli import _build_hook_parser
-from docwrap._hook import run_hook
+from docwrap._hook_front import _build_hook_parser, run_hook
 from docwrap._hosts import load_adapter
 from docwrap.hooks import (
     API_VERSION,
@@ -20,9 +19,9 @@ from docwrap.hooks import (
     HostResponse,
 )
 from plugins.claude._docwrap._adapter import ClaudeAdapter
+from tests.helpers import decode_text, git_commit_all, run_setup
 
 ROOT = Path(__file__).resolve().parents[3]
-CORPUS = ROOT / 'tests' / 'data' / 'commit_classification.json'
 DENY_JSON = {
     'hookSpecificOutput': {
         'hookEventName': 'PreToolUse',
@@ -43,6 +42,8 @@ def _decision(stdout: str) -> str | None:
     if not stdout:
         return None
     data = json.loads(stdout)
+    if 'systemMessage' in data:
+        return None
     if 'hookSpecificOutput' in data:
         return str(data['hookSpecificOutput']['permissionDecision'])
     return str(data['example']['decision'])
@@ -65,39 +66,63 @@ class TestClaudeAdapter:
             False,
         )
 
-    def test_decisions_match_the_third_party_example_over_the_corpus(
+    @pytest.mark.usefixtures('example_hosts')
+    @pytest.mark.parametrize('host', ['claude', 'example'])
+    @pytest.mark.parametrize(
+        ('command', 'outcome'),
+        [
+            pytest.param('ls', 'unrelated', id='unrelated'),
+            pytest.param('git commit --future-option -m x', 'denied', id='denied'),
+            pytest.param('git commit -m x', 'wrapped', id='supported'),
+        ],
+    )
+    def test_hook_decisions_preserve_adapter_independence(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
-        example_hosts: Path,
+        host: str,
+        command: str,
+        outcome: Literal['unrelated', 'denied', 'wrapped'],
     ) -> None:
-        del example_hosts
-        (tmp_path / 'repo').mkdir()
-        (tmp_path / ';').mkdir()
+        run_setup(['git', 'init'], cwd=tmp_path)
+        run_setup(['git', 'config', 'docwrap.hook', 'true'], cwd=tmp_path)
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.docwrap]\nline-length = 40\nfill-style = "greedy"\n', encoding='utf-8'
+        )
+        target = tmp_path / 'sample.py'
+        target.write_text('pass\n', encoding='utf-8')
+        git_commit_all(tmp_path)
+        source = (
+            'def f():\n    """Summary.\n\n'
+            '    one two three four five six seven eight nine ten eleven twelve\n'
+            '    """\n'
+        )
+        target.write_text(source, encoding='utf-8')
+        run_setup(['git', 'add', 'sample.py'], cwd=tmp_path)
+        payload = json.dumps(
+            _payload('PreToolUse', 'Bash', {'command': command}) | {'cwd': str(tmp_path)}
+        )
 
-        def enabled(_cwd: str | None = None) -> bool:
-            return True
+        status = run_hook(payload, host=host)
 
-        monkeypatch.setattr('docwrap._hook.is_hook_enabled', enabled)
-        entries = json.loads(CORPUS.read_text(encoding='utf-8'))['entries']
-        for entry in entries:
-            payload = json.dumps(
-                _payload('PreToolUse', 'Bash', {'command': entry['command']})
-                | {'cwd': str(tmp_path)}
-            )
-            decisions = [
-                (run_hook(payload, host=host), _decision(capsys.readouterr().out))
-                for host in ('claude', 'example')
-            ]
-            assert decisions[0] == decisions[1], entry['id']
-            # This native payload establishes cwd, unlike the unknown-cwd corpus variants.
-            if (
-                entry['outcome'] != 'supported'
-                and entry.get('command_cwd', str(tmp_path)) is not None
-            ):
-                expected = 'deny' if entry['outcome'] == 'unsupported' else None
-                assert decisions[0] == (0, expected), entry['id']
+        captured = capsys.readouterr()
+        expected_decision = 'deny' if outcome == 'denied' else None
+        assert (status, _decision(captured.out)) == (0, expected_decision)
+        if expected_decision == 'deny':
+            assert 'unsupported commit command' in captured.err
+        else:
+            assert captured.err == ''
+        expected = (
+            'def f():\n    """Summary.\n\n'
+            '    one two three four five six seven\n'
+            '    eight nine ten eleven twelve\n'
+            '    """\n'
+            if outcome == 'wrapped'
+            else source
+        )
+        staged = run_setup(['git', 'show', ':sample.py'], cwd=tmp_path)
+        assert decode_text(staged.stdout) == expected
+        assert target.read_text(encoding='utf-8') == expected
 
     def test_parse_missing_cwd_uses_process_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -168,6 +193,40 @@ class TestClaudeAdapter:
         assert json.loads(response.stdout) == DENY_JSON
         assert response.stderr == 'docwrap: reason\n'
         assert response.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ('reason', 'notes', 'context'),
+        [
+            (None, ('Cannot preserve layout.',), 'Cannot preserve layout.'),
+            ('Cannot wrap a.py: invalid syntax.', (), 'Cannot wrap a.py: invalid syntax.'),
+            ('first\nsecond', ('first', 'diagnostic'), 'first\ndiagnostic\nsecond'),
+        ],
+    )
+    def test_render_post_tool_context(
+        self, reason: str | None, notes: tuple[str, ...], context: str
+    ) -> None:
+        adapter = ClaudeAdapter()
+        assert adapter.parse(_payload('PostToolUse', 'Edit', {'file_path': 'a.py'}), None)
+        response = adapter.render(_result('allow', reason, notes))
+        assert json.loads(response.stdout) == {
+            'hookSpecificOutput': {
+                'hookEventName': 'PostToolUse',
+                'additionalContext': context,
+            }
+        }
+        assert response.stderr == ''.join(f'{note}\n' for note in notes)
+        assert response.exit_code == 0
+
+    @pytest.mark.parametrize('event', ['PreToolUse', 'Notification', None])
+    def test_render_resets_post_tool_context(self, event: str | None) -> None:
+        adapter = ClaudeAdapter()
+        adapter.parse(_payload('PostToolUse', 'Edit', {'file_path': 'a.py'}), None)
+        assert adapter.render(_result('allow')) == HostResponse('', '', 0)
+        adapter.parse({'hook_event_name': event}, None)
+        response = adapter.render(_result('deny', 'docwrap: reason'))
+        assert json.loads(response.stdout) == DENY_JSON
+        receipt = adapter.render(_result('allow', 'staged rewrite receipt'))
+        assert json.loads(receipt.stdout) == {'systemMessage': 'staged rewrite receipt'}
 
 
 @pytest.mark.usefixtures('registered_hosts')

@@ -1,7 +1,7 @@
 import pytest
 
 from docwrap._styles import EntryMatch, get_style
-from docwrap._styles._numpy import NumpyStyle
+from docwrap._styles._numpy import _NumpyStyle
 from docwrap._types import CanonicalRole
 
 
@@ -12,7 +12,7 @@ class TestCanonicalSections:
 
 class TestClassification:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_notes_is_prose(self) -> None:
         assert self.style.classify_section('Notes') == 'prose'
@@ -40,7 +40,7 @@ class TestClassification:
 
 class TestEntryMatching:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_comma_separated_names(self) -> None:
         match = self.style.match_entry('x1, x2 : array_like')
@@ -88,7 +88,7 @@ class TestEntryMatching:
 
 class TestFormatEntry:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_param_empty_description(self) -> None:
         em = EntryMatch(name='x', type_ann='int', description='')
@@ -122,12 +122,11 @@ class TestFormatEntry:
         em = EntryMatch(name='', type_ann='', description='The count.')
         result = self.style.format_entry(em, 'returns')
         assert result == ['    The count.']
-        assert not result[0].startswith('\n')  # no blank first line
 
 
 class TestSectionHeaders:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     def test_all_known_headers_recognized(self) -> None:
         for header in self.style.known_headers:
@@ -170,7 +169,7 @@ class TestSectionHeaders:
 
 class TestTargetRoleSupport:
     def setup_method(self) -> None:
-        self.style = NumpyStyle()
+        self.style = _NumpyStyle()
 
     @pytest.mark.parametrize(
         'role',

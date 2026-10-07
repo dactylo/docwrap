@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "files": {
+    "src/docwrap/_vendor/hookshell/__init__.py": "516598ef67153f17dc3b41b98aac5efe1842030b225ef56fdbcbb51e279015c5",
+    "src/docwrap/_vendor/hookshell/_classify.py": "5233343ed2628fa8345915101d9b187261622438b9fd15996b971dbfd4781b44",
+    "src/docwrap/_vendor/hookshell/_detector.py": "3e5a174b816a50c1f9e475cb9a6c0628592b13cda8264982f0e18662e53da0c0",
+    "src/docwrap/_vendor/hookshell/_grammar.py": "402b222a1304527fdccd1734486f9736da6b6d89fbc103f1ca8cc468be5b2f30",
+    "src/docwrap/_vendor/hookshell/_shell.py": "950948efc2c7791a3db2589f6bcee286404bac14067c5e0cf3e447d1c327b9e1",
+    "src/docwrap/_vendor/hookshell/_shellparse.py": "afb8ac434c28b4949fd3a6e0a954ce1eb6539922b9448adbf4af38e3a03728b4",
+    "tests/hookshell/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/hookshell/data/commit_classification.json": "afca44b4f6b583007aa22b430c100bfe4682f6072412e1787faec0ee06c4eb75",
+    "tests/hookshell/test_classify.py": "36d155412c64eb94d9ff72bafbe56e8f88619c2be287bf06f60cf36f41595826",
+    "tests/hookshell/test_detector.py": "fb4eebdcb17d6d6496c8a4009faba50289fdc11da26f4a367680c126e43c804e",
+    "tests/hookshell/test_grammar.py": "a4c3ff9aa917d62b7bee104eab40399a54dbc195d42a85726ceb3e8f0624216c",
+    "tests/hookshell/test_shell.py": "e3d3b22129d5c42e45cb1c40d53495362fd3dd6cad650204b48018bb83cdd5a1",
+    "tests/hookshell/test_shellparse.py": "151c2027c9af38969a77b66d88fc76f68590ce1aa1fa3a2fdd2ec67617c3e273"
+  }
+}

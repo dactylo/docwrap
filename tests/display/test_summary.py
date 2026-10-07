@@ -1,8 +1,9 @@
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import Mock
 
 import pytest
 
+from docwrap import _color
 from docwrap._color import YELLOW
 from docwrap._display import _summary as summary_module
 from docwrap._display._summary import format_summary
@@ -214,3 +215,12 @@ def _result(
         wrapped=wrapped,
         skipped_summaries=skipped_summaries,
     )
+
+
+def test_windows_summary_normalizes_only_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_color, 'PurePath', PureWindowsPath)
+    result = _result(r'C:\repo\file.py', 1, 1)
+    original = result.path
+    output = format_summary([result], color=False)
+    assert 'C:/repo/file.py' in output
+    assert result.path == original

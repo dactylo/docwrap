@@ -9,11 +9,32 @@ import pytest
 from docwrap import _downstream
 from docwrap._downstream import (
     ClosableTextOutput,
+    _is_downstream_closure,
+    _silence_descriptor,
     closable_stdout,
-    is_downstream_closure,
-    silence_descriptor,
+    ensure_utf8_stdio,
     stdout_closed,
 )
+
+
+class TestEnsureUtf8Stdio:
+    def test_noop_without_reconfigure(self) -> None:
+        ensure_utf8_stdio()  # StringIO lacks reconfigure; should not raise
+
+    @pytest.mark.parametrize('name', ['stdin', 'stdout', 'stderr'])
+    def test_reconfigures_text_streams_to_utf8_keeping_errors(
+        self, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stream = io.TextIOWrapper(io.BytesIO(), encoding='latin-1', errors='surrogateescape')
+        for standard_name in ('stdin', 'stdout', 'stderr'):
+            monkeypatch.setattr(
+                sys, standard_name, stream if standard_name == name else io.StringIO()
+            )
+
+        ensure_utf8_stdio()
+
+        assert stream.encoding == 'utf-8'
+        assert stream.errors == 'surrogateescape'
 
 
 class _FailingStream(io.StringIO):
@@ -31,8 +52,9 @@ class _FailingStream(io.StringIO):
 
 
 @pytest.mark.parametrize('windows', [False, True])
-def test_broken_pipe_is_closure_everywhere(windows: bool) -> None:
-    assert is_downstream_closure(BrokenPipeError(), windows=windows)
+def test_broken_pipe_is_closure_everywhere(windows: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', windows)
+    assert _is_downstream_closure(BrokenPipeError())
 
 
 def test_closable_stdout_flushes_when_leaving_by_system_exit(
@@ -46,11 +68,10 @@ def test_closable_stdout_flushes_when_leaving_by_system_exit(
 
     stream = _BufferedClosedStream()
 
-    def record(closed: object) -> bool:
+    def record(closed: object) -> None:
         silenced.append(closed)
-        return True
 
-    monkeypatch.setattr(_downstream, 'silence_descriptor', record)
+    monkeypatch.setattr(_downstream, '_silence_descriptor', record)
     monkeypatch.setattr(sys, 'stdout', stream)
 
     def exit_after_help() -> None:
@@ -60,31 +81,6 @@ def test_closable_stdout_flushes_when_leaving_by_system_exit(
     with pytest.raises(SystemExit), closable_stdout():
         exit_after_help()
     assert silenced == [stream]
-
-
-def test_closable_stdout_replaces_a_closed_stream_without_a_descriptor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _ClosedNoDescriptor(io.StringIO):
-        flushes = 0
-
-        def flush(self) -> None:
-            self.flushes += 1
-            raise BrokenPipeError
-
-    stream = _ClosedNoDescriptor()
-    monkeypatch.setattr(sys, 'stdout', stream)
-
-    with closable_stdout():
-        print('help text')
-
-    replacement = sys.stdout
-    assert replacement is not stream
-    assert stream.getvalue() == 'help text\n'
-    assert stream.flushes == 1
-    replacement.write('discarded')
-    replacement.flush()
-    replacement.close()
 
 
 def test_closable_stdout_restores_the_original_stream() -> None:
@@ -100,11 +96,10 @@ def test_closable_stdout_silences_a_closed_descriptor(
 ) -> None:
     silenced: list[object] = []
 
-    def record(stream: object) -> bool:
+    def record(stream: object) -> None:
         silenced.append(stream)
-        return True
 
-    monkeypatch.setattr(_downstream, 'silence_descriptor', record)
+    monkeypatch.setattr(_downstream, '_silence_descriptor', record)
     monkeypatch.setattr(sys, 'stdout', _FailingStream(BrokenPipeError()))
     original = sys.stdout
 
@@ -114,22 +109,26 @@ def test_closable_stdout_silences_a_closed_descriptor(
     assert silenced == [original]
 
 
-def test_einval_is_closure_only_on_windows() -> None:
+def test_einval_is_closure_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     error = OSError(errno.EINVAL, 'Invalid argument')
-    assert is_downstream_closure(error, windows=True)
-    assert not is_downstream_closure(error, windows=False)
+    monkeypatch.setattr(_downstream, '_WINDOWS', True)
+    assert _is_downstream_closure(error)
+    monkeypatch.setattr(_downstream, '_WINDOWS', False)
+    assert not _is_downstream_closure(error)
 
 
-def test_flush_latches_windows_einval() -> None:
-    output = ClosableTextOutput(_FailingStream(OSError(errno.EINVAL, 'closed')), windows=True)
+def test_flush_latches_windows_einval(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', True)
+    output = ClosableTextOutput(_FailingStream(OSError(errno.EINVAL, 'closed')))
 
     output.flush()
     output.flush()
     assert output.closed_downstream
 
 
-def test_flush_propagates_unrelated_errno() -> None:
-    output = ClosableTextOutput(_FailingStream(OSError(errno.EBADF, 'bad')), windows=True)
+def test_flush_propagates_unrelated_errno(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', True)
+    output = ClosableTextOutput(_FailingStream(OSError(errno.EBADF, 'bad')))
 
     with pytest.raises(OSError, match='bad'):
         output.flush()
@@ -137,28 +136,28 @@ def test_flush_propagates_unrelated_errno() -> None:
 
 def test_other_attributes_come_from_the_wrapped_stream() -> None:
     stream = io.StringIO()
-    output = ClosableTextOutput(stream, windows=False)
+    output = ClosableTextOutput(stream)
 
     assert output.getvalue is not None
     output.write('kept')
     assert stream.getvalue() == 'kept'
 
 
-def test_silence_descriptor_reports_streams_without_descriptors() -> None:
-    assert not silence_descriptor(io.StringIO())
-
-
-def test_unrelated_errno_is_not_closure() -> None:
-    assert not is_downstream_closure(OSError(errno.EBADF, 'bad'), windows=True)
+def test_unrelated_errno_is_not_closure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', True)
+    assert not _is_downstream_closure(OSError(errno.EBADF, 'bad'))
 
 
 @pytest.mark.parametrize(
     ('error', 'windows'),
     [(BrokenPipeError(), False), (OSError(errno.EINVAL, 'closed'), True)],
 )
-def test_write_latches_closure_and_discards_later_text(error: OSError, windows: bool) -> None:
+def test_write_latches_closure_and_discards_later_text(
+    error: OSError, windows: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', windows)
     stream = _FailingStream(error)
-    output = ClosableTextOutput(stream, windows=windows)
+    output = ClosableTextOutput(stream)
 
     assert output.write('first') == len('first')
     assert output.write('second') == len('second')
@@ -170,8 +169,11 @@ def test_write_latches_closure_and_discards_later_text(error: OSError, windows: 
     ('error', 'windows'),
     [(OSError(errno.EINVAL, 'closed'), False), (OSError(errno.EBADF, 'bad'), True)],
 )
-def test_write_propagates_errors_that_are_not_closure(error: OSError, windows: bool) -> None:
-    output = ClosableTextOutput(_FailingStream(error), windows=windows)
+def test_write_propagates_errors_that_are_not_closure(
+    error: OSError, windows: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_downstream, '_WINDOWS', windows)
+    output = ClosableTextOutput(_FailingStream(error))
 
     with pytest.raises(OSError, match=r'closed|bad') as raised:
         output.write('text')
@@ -211,15 +213,24 @@ def test_silence_descriptor_closes_devnull_and_propagates_redirect_failure(
     monkeypatch.setattr(_downstream, 'os', fake)
 
     with pytest.raises(OSError, match='injected redirect failure'):
-        silence_descriptor(_DescriptorStream())
+        _silence_descriptor(_DescriptorStream())
     assert fake.events == [('dup2', 37), ('close', 37)]
+
+
+def test_silence_descriptor_ignores_streams_without_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeOs(redirect_error=None)
+    monkeypatch.setattr(_downstream, 'os', fake)
+    _silence_descriptor(io.StringIO())
+    assert fake.events == []
 
 
 def test_silence_descriptor_redirects_a_descriptor(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeOs(redirect_error=None)
     monkeypatch.setattr(_downstream, 'os', fake)
 
-    assert silence_descriptor(_DescriptorStream())
+    _silence_descriptor(_DescriptorStream())
     assert fake.events == [('dup2', 37), ('close', 37)]
 
 
@@ -231,7 +242,7 @@ def test_writelines_stops_consuming_after_closure() -> None:
             consumed.append(index)
             yield f'{index}\n'
 
-    output = ClosableTextOutput(_FailingStream(BrokenPipeError()), windows=False)
+    output = ClosableTextOutput(_FailingStream(BrokenPipeError()))
     output.writelines(lines())
     assert consumed == [0]
 

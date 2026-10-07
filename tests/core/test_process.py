@@ -244,7 +244,7 @@ class TestPreWrapped:
         )
         docstrings = find_docstrings(source)
         cfg = DocwrapConfig(line_length=40)
-        parsed_list = parse_docstrings(source, docstrings, cfg)
+        parsed_list = parse_docstrings(source, docstrings, cfg, skips=[])
         pd = parsed_list[0]
         normal_result = wrap_parsed_docstring(pd, cfg, style_override=None)
         pre_wrapped = (
@@ -284,7 +284,7 @@ class TestPreWrapped:
         source = 'def foo():\n    """Summary."""\n'
         docstrings = find_docstrings(source)
         cfg = DocwrapConfig(convert='numpy')
-        parsed_list = parse_docstrings(source, docstrings, cfg)
+        parsed_list = parse_docstrings(source, docstrings, cfg, skips=[])
         pd = parsed_list[0]
         with pytest.raises(ValueError, match=r'pre_wrapped.*convert'):
             wrap_parsed_docstring(pd, cfg, style_override=None, pre_wrapped='Summary.')
@@ -293,7 +293,7 @@ class TestPreWrapped:
         source = 'def foo():\n    """Summary."""\n'
         docstrings = find_docstrings(source)
         cfg = DocwrapConfig(strip_types=True)
-        parsed_list = parse_docstrings(source, docstrings, cfg)
+        parsed_list = parse_docstrings(source, docstrings, cfg, skips=[])
         pd = parsed_list[0]
         with pytest.raises(ValueError, match=r'pre_wrapped.*strip_types'):
             wrap_parsed_docstring(pd, cfg, style_override=None, pre_wrapped='Summary.')
@@ -961,7 +961,7 @@ class TestWrapFileReport:
         path.write_bytes(original)
         real_reader = read_file_result
         real_writer = process_mod.write_preserving_newline
-        writer_raw: list[bytes | None] = []
+        writer_raw: list[bytes] = []
 
         def mutating_reader(candidate: Path) -> ReadResult:
             result = real_reader(candidate)
@@ -973,7 +973,7 @@ class TestWrapFileReport:
             source: str,
             encoding: str,
             *,
-            raw: bytes | None = None,
+            raw: bytes,
         ) -> None:
             writer_raw.append(raw)
             real_writer(candidate, source, encoding, raw=raw)
@@ -1500,9 +1500,9 @@ def _assert_generated_idempotence(
             wrap_summary=wrap_summary,
         )
         try:
-            assert_region_projection(source, config)
             first = wrap_source(source, config=config)
             ast.parse(first)
+            assert_region_projection(source, config, emitted_source=first)
         except (AssertionError, RuntimeError, SyntaxError) as exc:
             raise AssertionError(context) from exc
         second = wrap_source(first, config=config)
@@ -1512,7 +1512,7 @@ def _assert_generated_idempotence(
 def _parse_one(source: str, config: DocwrapConfig | None = None) -> ParsedDocstring:
     cfg = config or DocwrapConfig()
     docstrings = find_docstrings(source)
-    results = parse_docstrings(source, docstrings, cfg)
+    results = parse_docstrings(source, docstrings, cfg, skips=[])
     assert len(results) >= 1
     return results[0]
 
@@ -1653,7 +1653,7 @@ class TestEscapeRegionCoverage:
         assert unsupported_span in first.source
         assert scan_escape_spellings(first.source) == scan_escape_spellings(source)
         ast.parse(first.source)
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first.source)
         assert second.source == first.source
 
     def test_convert_reorder_keeps_escape_attachment(self) -> None:
@@ -2301,7 +2301,7 @@ class TestNoWrapSummaryProvenance:
         summary_source_lines = first.splitlines()[1:3]
         assert max(map(len, summary_source_lines)) <= 79
         assert second == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
     def test_no_wrap_google_conversion_conflict_binds_returns_header(self) -> None:
         summary_lines = (
@@ -2321,7 +2321,7 @@ class TestNoWrapSummaryProvenance:
         assert self._summary_lines(first, config) == expected
         assert '    Args:\n        value (str): Converted.' in first
         assert wrap_source(first, config=config) == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
     def test_no_wrap_long_logical_provenance_remains_physically_compliant(self) -> None:
         summary_lines = tuple(f'Line {index}: ' + 'x' * 64 for index in range(1, 7))
@@ -2335,7 +2335,7 @@ class TestNoWrapSummaryProvenance:
         assert self._summary_lines(first, config) == summary_lines
         assert all(len(line) <= config.line_length for line in first.splitlines()[1:7])
         assert wrap_source(first, config=config) == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
     def test_no_wrap_numpy_conversion_conflict_binds_returns_header(self) -> None:
         summary_lines = (
@@ -2357,7 +2357,7 @@ class TestNoWrapSummaryProvenance:
         assert self._summary_lines(first, config) == expected
         assert '    Parameters\n    ----------\n    value : str' in first
         assert wrap_source(first, config=config) == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
     @pytest.mark.parametrize(
         ('summary_start', 'layout'),
@@ -2436,7 +2436,7 @@ class TestNoWrapSummaryProvenance:
             assert 'x (str):' not in first
             assert '        x: Short.' in first
         assert second == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
     def test_no_wrap_sphinx_conversion_conflict_binds_field_token(self) -> None:
         summary_lines = (
@@ -2458,7 +2458,7 @@ class TestNoWrapSummaryProvenance:
         assert self._summary_lines(first, config) == expected
         assert '    :param value: Converted.' in first
         assert wrap_source(first, config=config) == first
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=first)
 
 
 class TestOpeningTitlePreservation:
@@ -3064,7 +3064,7 @@ class TestReviewRemediationCorpus:
         ast.parse(first)
         second = wrap_source(first, config=config)
         assert second == first, case.name
-        assert_region_projection(case.source, config)
+        assert_region_projection(case.source, config, emitted_source=first)
         self._assert_case_invariants(first, case, config)
 
 
@@ -3234,26 +3234,22 @@ class TestSimpleTableWrapping:
 
 
 class TestSourceNewlines:
-    @pytest.mark.parametrize('newline', ['\n', '\r\n', '\r'], ids=['lf', 'crlf', 'cr'])
-    def test_parenthesized_non_ascii_column(self, newline: str) -> None:
-        prefix = '# before' + newline + 'def café(): ('
-        body = (
-            '"""Summary.'
-            + newline
-            + newline
-            + 'This is a long body paragraph that is long enough to require '
-            'actual wrapping at width forty.' + newline + '"""'
+    def test_inline_tab_margin_projection_uses_emitted_literal(self) -> None:
+        source = (
+            'def f():\n'
+            '\t("""Summary.\n'
+            '\n'
+            '\tA long body paragraph with enough words to wrap at width forty five '
+            'and test margin behavior.\n'
+            '\t""")\n'
         )
-        suffix = '); marker = "é"' + newline + '# after'
-        source = prefix + body + suffix
-        config = DocwrapConfig(line_length=40)
-        report = docwrap.wrap_source_report(source, config=config)
+        config = DocwrapConfig(line_length=45)
+        report = wrap_source_report(source, config=config)
+
         assert report.wrapped == 1
         assert report.skips == ()
-        assert report.source.startswith(prefix)
-        assert report.source.endswith(suffix)
-        assert 'This is a long body\nparagraph that is long\n' in report.source
-        assert docwrap.wrap_source(report.source, config=config) == report.source
+        assert '\n A long body paragraph' in report.source
+        assert_region_projection(source, config, emitted_source=report.source)
 
     def test_mixed_terminators_and_two_literals(self) -> None:
         body = (
@@ -3277,7 +3273,28 @@ class TestSourceNewlines:
         assert report.skips == ()
         assert report.source == prefix + expected_literal + between + expected_literal + suffix
         assert docwrap.wrap_source(report.source, config=config) == report.source
-        assert_region_projection(source, config)
+        assert_region_projection(source, config, emitted_source=report.source)
+
+    @pytest.mark.parametrize('newline', ['\n', '\r\n', '\r'], ids=['lf', 'crlf', 'cr'])
+    def test_parenthesized_non_ascii_column(self, newline: str) -> None:
+        prefix = '# before' + newline + 'def café(): ('
+        body = (
+            '"""Summary.'
+            + newline
+            + newline
+            + 'This is a long body paragraph that is long enough to require '
+            'actual wrapping at width forty.' + newline + '"""'
+        )
+        suffix = '); marker = "é"' + newline + '# after'
+        source = prefix + body + suffix
+        config = DocwrapConfig(line_length=40)
+        report = docwrap.wrap_source_report(source, config=config)
+        assert report.wrapped == 1
+        assert report.skips == ()
+        assert report.source.startswith(prefix)
+        assert report.source.endswith(suffix)
+        assert 'This is a long body\nparagraph that is long\n' in report.source
+        assert docwrap.wrap_source(report.source, config=config) == report.source
 
     @pytest.mark.parametrize('newline', ['\n', '\r\n', '\r'], ids=['lf', 'crlf', 'cr'])
     @pytest.mark.parametrize('trailing', [False, True])
@@ -3634,7 +3651,7 @@ def test_summary_boundary_preserves_parser_projection(
 
     first = wrap_source(source, config=config)
     ast.parse(first)
-    assert_region_projection(source, config)
+    assert_region_projection(source, config, emitted_source=first)
     second = wrap_source(first, config=config)
     function = ast.parse(first).body[0]
     assert isinstance(function, ast.FunctionDef)

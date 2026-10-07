@@ -10,6 +10,7 @@ from docwrap._core import (
     simulate_wrap_delta,
     wrap_parsed_docstring,
 )
+from docwrap._core._wrap import VERBATIM_REGION_KINDS
 from docwrap._types import (
     DocwrapConfig,
     MeasurementCategory,
@@ -19,12 +20,13 @@ from docwrap._types import (
 BUCKET_BOUNDS = (40, 50, 60, 70, 80, 90, 100)
 PERCENTILE_LEVELS = (50, 75, 90, 95, 99)
 STANDARD_LENGTHS = (72, 79, 80, 88, 99, 100)
+WRAPPABLE_CATEGORIES = ('prose', 'args', 'summary')
 _ARGS_KINDS = frozenset({'entry'})
 _CODE_BLOCK_KINDS = frozenset({'code_block'})
 _DEFAULT_CFG = DocwrapConfig()
 _PROSE_KINDS = frozenset({'description', 'list_item', 'prose'})
 _SUMMARY_KINDS = frozenset({'summary'})
-_WIDTH_INVARIANT_KINDS = frozenset({'blank', 'code_block', 'section_header', 'title'})
+_WIDTH_INVARIANT_KINDS = VERBATIM_REGION_KINDS | frozenset({'blank'})
 _WIDTH_INVARIANT_KINDS_NO_WRAP = _WIDTH_INVARIANT_KINDS | frozenset({'summary'})
 
 
@@ -32,7 +34,7 @@ _WIDTH_INVARIANT_KINDS_NO_WRAP = _WIDTH_INVARIANT_KINDS | frozenset({'summary'})
 class Bucket:
     """A single histogram bucket.
 
-    Args:
+    Attributes:
         upper: Upper bound of the bucket, or 0 for the overflow bucket.
         count: Number of lines falling into this bucket.
         zone_counts: One count per boundary zone plus overflow, or None if no
@@ -50,7 +52,7 @@ class Bucket:
 class Histogram:
     """Line length histogram.
 
-    Args:
+    Attributes:
         buckets: Tuple of buckets from lowest to highest bound, plus overflow.
         total: Total number of lines measured.
     """
@@ -63,7 +65,7 @@ class Histogram:
 class ImpactRow:
     """Impact of wrapping at a specific line length.
 
-    Args:
+    Attributes:
         line_length: The line length threshold.
         docstrings_changed: Number of docstrings that would change.
         files_changed: Always 0 or 1 for single-source; aggregated by CLI.
@@ -82,7 +84,7 @@ class ImpactRow:
 class LineMeasurement:
     """A single measured line from a docstring.
 
-    Args:
+    Attributes:
         length: Absolute line length including indentation.
         category: The measurement category classification for this line.
         file_path: Path to the source file.
@@ -104,7 +106,7 @@ class LineMeasurement:
 class Percentiles:
     """Percentile statistics computed from line measurements.
 
-    Args:
+    Attributes:
         levels: Mapping from percentile level to value. Keys match
             PERCENTILE_LEVELS (e.g. {50: 37, 75: 53, 90: 68, 95: 80, 99: 95}).
         max: Absolute maximum value (not a percentile).
@@ -118,14 +120,16 @@ class Percentiles:
 class StatsData:
     """Aggregated statistics from CLI file scanning.
 
-    Args:
+    Attributes:
         docstring_count: Total number of docstrings found.
         docstring_file_count: Number of files containing docstrings.
         impact: Mapping of line length to ImpactRow.
         measurements: All docstring line measurements.
-        skipped_count: Number of files skipped due to errors.
+        skipped_count: Number of unreadable files skipped.
         source_measurements: All source code line measurements.
         safety_skip_count: Number of docstrings skipped for safety.
+        unparseable_count: Number of files omitted because they could not be
+            parsed.
     """
 
     docstring_count: int
@@ -135,12 +139,13 @@ class StatsData:
     skipped_count: int
     source_measurements: list[LineMeasurement]
     safety_skip_count: int = 0
+    unparseable_count: int = 0
 
 
 class ZoneBoundaries(NamedTuple):
     """Percentile boundaries for line-length zone classification.
 
-    Args:
+    Attributes:
         median: Median line length.
         p75: 75th-percentile line length.
         p90: 90th-percentile line length.
@@ -185,8 +190,8 @@ def _is_width_invariant(regions: tuple[Region, ...], *, wrap_summary: bool) -> b
 def _wrappable_categories(*, wrap_summary: bool) -> tuple[str, ...]:
     """Return ordered wrappable categories for the selected summary policy."""
     if wrap_summary:
-        return ('prose', 'args', 'summary')
-    return ('prose', 'args')
+        return WRAPPABLE_CATEGORIES
+    return WRAPPABLE_CATEGORIES[:-1]
 
 
 def _measure_from_source_lines(
@@ -432,6 +437,35 @@ def find_outliers(measurements: list[LineMeasurement], *, n: int = 3) -> list[Li
     return heapq.nlargest(n, measurements, key=lambda m: m.length)
 
 
+def measure_docstring(
+    parsed: list[ParsedDocstring],
+    *,
+    file_path: str = '',
+    wrap_summary: bool = False,
+) -> list[LineMeasurement]:
+    """Measure line lengths for pre-parsed docstrings.
+
+    Args:
+        parsed: Pre-parsed docstrings from parse_docstrings.
+        file_path: Path to the source file (for reporting).
+        wrap_summary: Whether summary lines are wrappable.
+
+    Returns:
+        List of LineMeasurement for each measurable line.
+    """
+    all_measurements: list[LineMeasurement] = []
+
+    for pd in parsed:
+        measurements = _measure_from_source_lines(
+            pd,
+            file_path,
+            wrap_summary,
+        )
+        all_measurements.extend(measurements)
+
+    return all_measurements
+
+
 def measure_source_lines(
     source: str,
     docstring_ranges: list[tuple[int, int]],
@@ -479,35 +513,6 @@ def measure_source_lines(
         )
 
     return measurements
-
-
-def measure_docstring(
-    parsed: list[ParsedDocstring],
-    *,
-    file_path: str = '',
-    wrap_summary: bool = False,
-) -> list[LineMeasurement]:
-    """Measure line lengths for pre-parsed docstrings.
-
-    Args:
-        parsed: Pre-parsed docstrings from parse_docstrings.
-        file_path: Path to the source file (for reporting).
-        wrap_summary: Whether summary lines are wrappable.
-
-    Returns:
-        List of LineMeasurement for each measurable line.
-    """
-    all_measurements: list[LineMeasurement] = []
-
-    for pd in parsed:
-        measurements = _measure_from_source_lines(
-            pd,
-            file_path,
-            wrap_summary,
-        )
-        all_measurements.extend(measurements)
-
-    return all_measurements
 
 
 def source_boundaries(

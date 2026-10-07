@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import errno
 import importlib.metadata
@@ -8,9 +9,9 @@ import re
 import subprocess
 import sys
 import tokenize
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
-from typing import assert_type
+from typing import Literal, assert_type
 from unittest.mock import Mock, patch
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 import docwrap._cli as cli_mod
 import docwrap._display as display_mod
 import docwrap._downstream as downstream_mod
+import docwrap._hook_front as front_mod
 import docwrap._stats as stats_mod
 from docwrap._cli import (
     _EXIT_CHANGED,
@@ -52,15 +54,17 @@ from docwrap._types import (
     DocwrapConfig,
     IncrementalLevel,
     LineLengthSource,
-    Newline,
     WrapOverrides,
     WrapReport,
 )
 from tests.helpers import (
+    EXAMPLE_ENTRY_POINTS,
+    ROOT,
     decode_text,
     git_commit_all,
     invoke_cli,
     process_transcript,
+    register_distribution,
     run_cli,
     run_closing_after_first_line,
     run_setup,
@@ -80,6 +84,27 @@ _BODY_WRAPPABLE_SOURCE = (
     'line length and require wrapping by docwrap.\n'
     '    """\n'
 )
+_BUDGET_SCRIPT = """
+import runpy
+import sys
+
+heavy = ('docwrap._hook', 'docwrap._cli', 'docwrap._library', 'docwrap._core',
+         'docwrap._config', 'docwrap._files', 'docwrap._git', 'docwrap._display',
+         'docwrap._styles')
+sys.argv = ['docwrap', 'hook', '--agent', 'claude']
+try:
+    runpy.run_module('docwrap', run_name='__main__', alter_sys=True)
+except SystemExit as stop:
+    status = stop.code
+else:
+    status = None
+loaded = sorted(
+    name for name in sys.modules
+    if name in heavy or any(name.startswith(prefix + '.') for prefix in heavy)
+)
+sys.stderr.write(f'budget-status={status}\\n')
+sys.stderr.write('budget-loaded=' + ','.join(loaded) + '\\n')
+"""
 _CLOSED_STDOUT_STATUS = {
     'large-before-write': _EXIT_CHANGED,
     'small-before-write': _EXIT_CHANGED,
@@ -95,6 +120,22 @@ _GREEDY_WRAPPED_SOURCE = (
     '    parts). Yields (header, dest_path) pairs.\n'
     '    """\n'
 )
+_HOOK_HELP = {
+    'options': (
+        '-h, --help show this help message and exit',
+        '-a, --agent NAME coding agent: agy, claude, codex',
+        '-e, --event NAME hook event, for agents whose payload does not name it (agy)',
+        '-i, --incremental wrap only docstrings affected by changes since the last commit',
+        (
+            '--no-incremental wrap every docstring, even when configuration enables '
+            'incremental mode'
+        ),
+        (
+            '--allow-on-failure allow the command when docwrap itself fails; unsupported '
+            'commits are still denied'
+        ),
+    ),
+}
 _SKIP_ONLY_SOURCE = 'def skipme():\n    """Line one ' + BACKSLASH + '\n    continued."""\n'
 _MIXED_SKIP_SOURCE = (
     _SKIP_ONLY_SOURCE + '\n\n' + 'def wrapme(value):\n'
@@ -104,6 +145,77 @@ _MIXED_SKIP_SOURCE = (
     'definitely be wrapped.\n'
     '    """\n'
 )
+_ROOT_HELP = {
+    'positional arguments': ('PATH files or directories to check (default: current directory)',),
+    'options': (
+        '-h, --help show this help message and exit',
+        '--version show the version and exit',
+    ),
+    'output (choose one)': (
+        '-p, --preview show each docstring that would change',
+        '-d, --diff show a unified diff',
+        '-w, --write rewrite files in place',
+        '-j, --json print results as JSON',
+        '-s, --stats report docstring line lengths and help choose a line length',
+    ),
+    'wrapping': (
+        '-l, --length N maximum line length (default: 79)',
+        (
+            '--reflow {none,cautious,full} how freely to rejoin lines before wrapping '
+            '(default: cautious)'
+        ),
+        '--fill-style {balanced,greedy,smart} how to choose line breaks (default: smart)',
+        (
+            '--smart-slack N columns smart fill may give up to avoid a stranded fragment '
+            '(default: 8)'
+        ),
+        (
+            '--summary-start {preserve,first-line,second-line} where a multi-line summary '
+            'starts (default: preserve)'
+        ),
+        (
+            '--wrap-summary, --no-wrap-summary wrap summaries longer than the line length '
+            '(default: off)'
+        ),
+        (
+            '--style {google,numpy,sphinx} use this docstring style instead of detecting each '
+            "docstring's style"
+        ),
+    ),
+    'conversion': (
+        '--convert {google,numpy,sphinx} rewrite docstrings in another style',
+        '--strip-types remove inline types from structured entries, such as param (str):',
+    ),
+    'selection': (
+        '-i, --incremental wrap only docstrings affected by changes since the last commit',
+        (
+            '--incremental-level {file,definition,docstring} how much around each change to '
+            'wrap; implies --incremental'
+        ),
+        (
+            '--no-incremental wrap every docstring, even when configuration enables '
+            'incremental mode'
+        ),
+    ),
+    'display': (
+        '-v, --verbose also list unchanged files',
+        '--color {auto,always,never} when to use color (default: auto)',
+        (
+            '--show-skips in preview, list summaries left unwrapped because they are too long '
+            '(default: off)'
+        ),
+        (
+            '--hide-skips in preview, do not list summaries left unwrapped because they are '
+            'too long'
+        ),
+    ),
+    'statistics': (
+        '--stats-sections SECTION[,SECTION...] report sections to show, in order',
+        '--stats-longest-per-category N longest lines to list per category (default: 3)',
+    ),
+    'commands': ('hook run as a coding-agent hook (see docwrap hook --help)',),
+}
+
 _STATS_BODY_HEADINGS = (
     'Source code',
     'Docstrings (wrappable)',
@@ -197,17 +309,10 @@ class TestCaseAliasReporting:
             source: str,
             encoding: str,
             *,
-            raw: bytes | None = None,
-            fallback_newline: Newline = '\n',
+            raw: bytes,
         ) -> None:
             calls.append(path)
-            real_write(
-                path,
-                source,
-                encoding,
-                raw=raw,
-                fallback_newline=fallback_newline,
-            )
+            real_write(path, source, encoding, raw=raw)
 
         monkeypatch.setattr(cli_mod, 'write_preserving_newline', counting_write)
         assert main(['-w', str(target), str(alias)]) == 0
@@ -216,13 +321,9 @@ class TestCaseAliasReporting:
 
 class TestClosedStdout:
     @pytest.mark.parametrize('case', list(_CLOSED_STDOUT_STATUS))
-    def test_closure_is_quiet(self, case: str, tmp_path: Path) -> None:
+    def test_closure_is_quiet_and_preserves_status(self, case: str, tmp_path: Path) -> None:
         result = _closed_stdout_result(case, tmp_path)
         assert result.stderr == b'', process_transcript(result)
-
-    @pytest.mark.parametrize('case', list(_CLOSED_STDOUT_STATUS))
-    def test_closure_keeps_the_established_status(self, case: str, tmp_path: Path) -> None:
-        result = _closed_stdout_result(case, tmp_path)
         assert result.returncode == _CLOSED_STDOUT_STATUS[case], process_transcript(result)
 
 
@@ -259,7 +360,7 @@ class TestClosedStdoutInProcess:
         def fail_cli(_argv: Sequence[str] | None) -> int:
             raise OSError(errno.EINVAL, 'main work')
 
-        monkeypatch.setattr(cli_mod, '_run_cli', fail_cli)
+        monkeypatch.setattr(cli_mod, 'run_cli', fail_cli)
         monkeypatch.setattr(downstream_mod, '_WINDOWS', True)
 
         with pytest.raises(OSError, match='main work') as error:
@@ -275,18 +376,26 @@ class TestClosedStdoutInProcess:
             print('discarded')
             return _EXIT_CHANGED
 
-        monkeypatch.setattr(cli_mod, '_run_cli', run_cli)
+        monkeypatch.setattr(cli_mod, 'run_cli', run_cli)
         closed = _ClosedStream()
         monkeypatch.setattr(sys, 'stdout', closed)
 
-        try:
-            assert main([]) == _EXIT_CHANGED
-            assert sys.stdout is not closed
-            assert sys.stdout.write('discarded') == len('discarded')
-            sys.stdout.flush()
-        finally:
-            if sys.stdout is not closed:
-                sys.stdout.close()
+        assert main([]) == _EXIT_CHANGED
+
+    @pytest.mark.parametrize(
+        'argv',
+        [['--help'], ['--version'], ['hook', '--agent', 'claude']],
+        ids=['help', 'version', 'hook'],
+    )
+    def test_unavailable_stdout_is_an_error(
+        self, argv: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Restore stdout before capsys finalizes, so its capture stream is not reinstated.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sys, 'stdout', None)
+            status = main(argv)
+
+        assert (status, capsys.readouterr().err) == (2, 'error: standard output is unavailable\n')
 
     def test_windows_einval_during_output_keeps_the_status(
         self, monkeypatch: pytest.MonkeyPatch
@@ -300,16 +409,11 @@ class TestClosedStdoutInProcess:
             return _EXIT_CHANGED
 
         monkeypatch.setattr(downstream_mod, '_WINDOWS', True)
-        monkeypatch.setattr(cli_mod, '_run_cli', run_cli)
+        monkeypatch.setattr(cli_mod, 'run_cli', run_cli)
         closed = _WindowsClosedStream()
         monkeypatch.setattr(sys, 'stdout', closed)
 
-        try:
-            assert main([]) == _EXIT_CHANGED
-            assert sys.stdout is not closed
-        finally:
-            if sys.stdout is not closed:
-                sys.stdout.close()
+        assert main([]) == _EXIT_CHANGED
 
 
 class TestColorOutput:
@@ -613,7 +717,7 @@ class TestDefaultOutput:
         header_fields = lines[0].split()
         assert header_fields == ['Name', 'Skip', 'Total', 'Wrap', 'Wrap%']
         # Data row contains file path and stats
-        assert str(f) in lines[1]
+        assert f.as_posix() in lines[1]
         assert '100%' in lines[1]
         # No TOTAL row for single file
         assert len(lines) == 2
@@ -695,8 +799,8 @@ class TestDefaultSummaryVisibility:
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
         # a.py shown (has changes), b.py hidden (no changes)
-        assert any(str(a) in line for line in lines)
-        assert not any(str(b) in line for line in lines)
+        assert any(a.as_posix() in line for line in lines)
+        assert not any(b.as_posix() in line for line in lines)
 
     def test_default_shows_summary(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -708,7 +812,7 @@ class TestDefaultSummaryVisibility:
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
         assert 'Name' in lines[0]
-        assert str(f) in lines[1]
+        assert f.as_posix() in lines[1]
 
     def test_write_shows_summary(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         f = tmp_path / 'test.py'
@@ -718,7 +822,7 @@ class TestDefaultSummaryVisibility:
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
         assert 'Name' in lines[0]
-        assert str(f) in lines[1]
+        assert f.as_posix() in lines[1]
 
 
 class TestDiffMode:
@@ -798,8 +902,8 @@ class TestErrorHandling:
         exit_code = main([str(tmp_path)])
         captured = capsys.readouterr()
         assert exit_code == 1
-        assert str(included) in captured.out
-        assert str(f) not in captured.out
+        assert included.as_posix() in captured.out
+        assert f.as_posix() not in captured.out
 
     def test_exit_2_takes_precedence_over_1(self, tmp_path: Path) -> None:
         # One file with syntax error, one with pending changes
@@ -828,7 +932,7 @@ class TestExitCodes:
         exit_code = main([str(f)])
         assert exit_code == 1
         captured = capsys.readouterr()
-        assert str(f) in captured.out
+        assert f.as_posix() in captured.out
 
     def test_no_changes_exit_0(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
@@ -1195,28 +1299,6 @@ class TestHelpDefaultHelpers:
 
 
 class TestHelpDefaults:
-    def test_builtin_defaults(self) -> None:
-        help_text = _build_parser().format_help()
-        assert _help_contains(help_text, 'Target line length (default: 79).')
-        assert _help_contains(help_text, 'Color output (default: auto).')
-        assert _help_contains(
-            help_text, 'Summary position relative to opening quotes (default: preserve).'
-        )
-        assert _help_contains(
-            help_text, 'Reflow mode: none, cautious, or full (default: cautious).'
-        )
-        assert _help_contains(
-            help_text, 'Fill style: balanced, greedy, or smart (default: smart).'
-        )
-        assert _help_contains(help_text, 'Smart-fill break-repair budget (default: 8).')
-
-    def test_builtin_wrap_summary_help(self) -> None:
-        help_text = _build_parser().format_help()
-        assert _help_contains(
-            help_text,
-            'Wrap summary lines that exceed the target length (default: False).',
-        )
-
     def test_config_file_defaults_in_help(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1243,34 +1325,36 @@ class TestHelpDefaults:
             color='never',
             line_length_source=LineLengthSource.DOCWRAP,
         )
-        help_text = _build_parser(cfg).format_help()
-        assert _help_contains(help_text, 'Target line length (default: 88, from [tool.docwrap]).')
-        assert _help_contains(help_text, 'Color output (default: never, from [tool.docwrap]).')
-        assert _help_contains(
-            help_text,
-            'Summary position relative to opening quotes'
-            ' (default: second-line, from [tool.docwrap]).',
+        option_help = _option_help(cfg)
+        assert option_help['-l/--length'] == (
+            'maximum line length (default: 88, from [tool.docwrap])'
         )
-        assert _help_contains(
-            help_text,
-            'Reflow mode: none, cautious, or full (default: full, from [tool.docwrap]).',
+        assert option_help['--color'] == 'when to use color (default: never, from [tool.docwrap])'
+        assert option_help['--summary-start'] == (
+            'where a multi-line summary starts (default: second-line, from [tool.docwrap])'
         )
-        assert _help_contains(
-            help_text,
-            'Fill style: balanced, greedy, or smart (default: greedy, from [tool.docwrap]).',
+        assert option_help['--reflow'] == (
+            'how freely to rejoin lines before wrapping (default: full, from [tool.docwrap])'
         )
-        assert _help_contains(
-            help_text,
-            'Smart-fill break-repair budget (default: 10, from [tool.docwrap]).',
+        assert option_help['--fill-style'] == (
+            'how to choose line breaks (default: greedy, from [tool.docwrap])'
+        )
+        assert option_help['--smart-slack'] == (
+            'columns smart fill may give up to avoid a stranded fragment'
+            ' (default: 10, from [tool.docwrap])'
+        )
+
+    def test_configured_show_skips_help(self) -> None:
+        cfg = ResolvedConfig(config=DocwrapConfig(), show_skips=True)
+        assert _option_help(cfg)['--show-skips'] == (
+            'in preview, list summaries left unwrapped because they are too long'
+            ' (default: on, from [tool.docwrap])'
         )
 
     def test_configured_wrap_summary_help(self) -> None:
         cfg = ResolvedConfig(config=DocwrapConfig(wrap_summary=True))
-        help_text = _build_parser(cfg).format_help()
-        assert _help_contains(
-            help_text,
-            'Wrap summary lines that exceed the target length'
-            ' (default: True, from [tool.docwrap]).',
+        assert _option_help(cfg)['--wrap-summary/--no-wrap-summary'] == (
+            'wrap summaries longer than the line length (default: on, from [tool.docwrap])'
         )
 
     def test_docwrap_source_line_length(self) -> None:
@@ -1278,158 +1362,158 @@ class TestHelpDefaults:
             config=DocwrapConfig(line_length=99),
             line_length_source=LineLengthSource.DOCWRAP,
         )
-        help_text = _build_parser(cfg).format_help()
-        assert _help_contains(help_text, 'Target line length (default: 99, from [tool.docwrap]).')
-
-    def test_hook_options_explain_event_and_failure_policy(self) -> None:
-        help_text = cli_mod._build_hook_parser().format_help()
-        for description in (
-            'Host event name; required only for hosts without an event in the payload.',
-            'Enable incremental wrapping at the configured level (default: definition).',
-            'Disable incremental wrapping, even when configured.',
-            'Allow accepted commands on hook failures; unsupported commits still deny.',
-        ):
-            assert _help_contains(help_text, description)
-
-    def test_incremental_help(self) -> None:
-        help_text = _build_parser().format_help()
-        assert _help_contains(
-            help_text,
-            'Enable incremental mode with the configured level (default when unset: definition).',
+        assert _option_help(cfg)['-l/--length'] == (
+            'maximum line length (default: 99, from [tool.docwrap])'
         )
 
-    def test_provider_help(self) -> None:
-        assert _help_contains(_build_parser().format_help(), 'Agent hook entry point')
-        assert _help_contains(
-            cli_mod._build_hook_parser().format_help(),
-            'Agent hook entry point; reads the host payload as JSON from stdin.',
-        )
-
-    def test_stats_options_describe_order_and_limit(self) -> None:
-        help_text = _build_parser().format_help()
-        assert '--stats-sections SECTION[,SECTION...]' in help_text
-        assert '--stats-longest-per-category N' in help_text
-        assert _help_contains(
-            help_text,
-            'Stats body sections, shown once in the listed order.',
+    @pytest.mark.parametrize(
+        ('incremental', 'suffix'),
+        [(None, ''), (False, ''), ('docstring', ' (level: docstring, from [tool.docwrap])')],
+    )
+    def test_incremental_help_names_only_a_configured_level(
+        self, incremental: IncrementalLevel | Literal[False] | None, suffix: str
+    ) -> None:
+        cfg = ResolvedConfig(config=DocwrapConfig(), incremental=incremental)
+        assert _option_help(cfg)['-i/--incremental'] == (
+            f'wrap only docstrings affected by changes since the last commit{suffix}'
         )
 
 
-class TestHelpFlagOrder:
-    def test_help_flags_present(self, capsys: pytest.CaptureFixture[str]) -> None:
-        with pytest.raises(SystemExit, match='0'):
-            main(['--help'])
-        out = capsys.readouterr().out
-        for flag in ('-p,', '-s,', '-d,', '-j,', '-w,', '-l,', '-v,'):
-            assert flag in out
-        assert '--show-skips' in out
-        assert '--hide-skips' in out
+class TestHelpLayout:
+    def test_every_visible_option_and_command_has_lowercase_help(self) -> None:
+        entries = [
+            *_help_entries(_build_parser(), 'docwrap'),
+            *_help_entries(front_mod._build_hook_parser(), 'docwrap hook'),
+            *(
+                (f'docwrap {name}', text)
+                for _title, commands in cli_mod._COMMAND_GROUPS
+                for name, text in commands
+            ),
+        ]
+        problems = [
+            f'{name}: {text!r}'
+            for name, text in entries
+            if not text or not _starts_in_lowercase_style(text) or text.endswith('.')
+        ]
+        assert problems == []
 
-    def test_top_level_help_section_membership(self) -> None:
-        help_text = _build_parser().format_help()
-        assert _help_section_options(help_text, 'options') == [
-            ('-h', '--help'),
-            ('--version',),
-            ('-p', '--preview'),
-            ('-s', '--stats'),
-            ('-d', '--diff'),
-            ('-j', '--json'),
-            ('-w', '--write'),
-            ('-l', '--length'),
-            ('-i', '--incremental'),
-            ('-v', '--verbose'),
-            ('--color',),
-            ('--no-incremental',),
-            ('--show-skips',),
-            ('--hide-skips',),
-        ]
-        assert _help_section_options(help_text, 'style options') == [
-            ('--style',),
-            ('--convert',),
-            ('--strip-types',),
-        ]
-        assert _help_section_options(help_text, 'wrapping policy options') == [
-            ('--incremental-level',),
-            ('--summary-start',),
-            ('--wrap-summary', '--no-wrap-summary'),
-            ('--fill-style',),
-            ('--smart-slack',),
-            ('--reflow',),
-        ]
-        assert _help_section_options(help_text, 'statistics options') == [
-            ('--stats-sections',),
-            ('--stats-longest-per-category',),
-        ]
+    def test_help_ends_with_the_commands_section(self, tmp_path: Path) -> None:
+        _status, stdout, _stderr = invoke_cli(['--help'], cwd=tmp_path)
 
-    def test_top_level_help_sections(self) -> None:
-        help_text = _build_parser().format_help()
-        headings = [
-            line.removesuffix(':')
-            for line in help_text.splitlines()
-            if line and not line.startswith(' ') and line.endswith(':')
-        ]
-        assert headings == [
-            'positional arguments',
-            'options',
-            'wrapping policy options',
-            'style options',
-            'statistics options',
-            'subcommands',
-        ]
+        assert stdout.endswith(
+            '\n\ncommands:\n'
+            '  hook                  run as a coding-agent hook (see docwrap hook --help)\n'
+        )
 
-    def test_top_level_usage_follows_section_priority(self) -> None:
-        usage = _build_parser().format_help().partition('\n\n')[0]
-        assert re.findall(r'(?<![\w-])--?[a-z][a-z-]*', usage) == [
-            '-h',
-            '--version',
-            '-p',
-            '-s',
-            '-d',
-            '-j',
-            '-w',
-            '-l',
-            '-i',
-            '-v',
-            '--color',
-            '--no-incremental',
-            '--show-skips',
-            '--hide-skips',
-            '--incremental-level',
-            '--summary-start',
-            '--wrap-summary',
-            '--no-wrap-summary',
-            '--fill-style',
-            '--smart-slack',
-            '--reflow',
-            '--style',
-            '--convert',
-            '--strip-types',
-            '--stats-sections',
-            '--stats-longest-per-category',
-        ]
+    def test_help_groups_every_option_with_its_help(self, tmp_path: Path) -> None:
+        _status, stdout, _stderr = invoke_cli(['--help'], cwd=tmp_path)
+
+        sections = _help_sections(stdout)
+        assert list(sections) == list(_ROOT_HELP)
+        assert sections == {title: ' '.join(entries) for title, entries in _ROOT_HELP.items()}
+
+    def test_help_starts_with_short_usage_and_description(self, tmp_path: Path) -> None:
+        status, stdout, stderr = invoke_cli(['--help'], cwd=tmp_path)
+
+        assert (status, stderr) == (0, '')
+        usage, description, _rest = stdout.split('\n\n', 2)
+        assert usage == 'usage: docwrap [options] [PATH ...]'
+        assert description == 'Wrap Python docstrings to a configured line length.'
+
+    def test_post_parse_error_prints_short_usage(self) -> None:
+        status, stdout, stderr = invoke_cli(['--length', '0'])
+
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: docwrap [options] [PATH ...]\n'
+            'docwrap: error: --length must be a positive integer\n'
+        )
+
+    def test_usage_error_prints_short_usage(self) -> None:
+        status, stdout, stderr = invoke_cli(['--bogus'])
+
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: docwrap [options] [PATH ...]\n'
+            'docwrap: error: unrecognized arguments: --bogus\n'
+        )
+
+
+class TestHookHelp:
+    @pytest.mark.usefixtures('registered_hosts')
+    def test_hook_help_groups_every_option_with_its_help(self) -> None:
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
+
+        sections = _help_sections(stdout)
+        assert list(sections) == list(_HOOK_HELP)
+        assert sections == {title: ' '.join(entries) for title, entries in _HOOK_HELP.items()}
+
+    def test_hook_help_lists_agents_from_the_registry(self, registered_hosts: Path) -> None:
+        register_distribution(
+            registered_hosts,
+            'docwrap-host-example',
+            {'example': EXAMPLE_ENTRY_POINTS['example']},
+        )
+
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
+
+        assert '\n  -a, --agent NAME    coding agent: agy, claude, codex, example\n' in stdout
+
+    def test_hook_help_starts_with_short_usage_and_description(self) -> None:
+        status, stdout, stderr = invoke_cli(['hook', '--help'])
+
+        assert (status, stderr) == (0, '')
+        usage, description, _rest = stdout.split('\n\n', 2)
+        assert usage == 'usage: docwrap hook --agent NAME [options]'
+        assert ' '.join(description.split()) == (
+            "Run docwrap as a coding-agent hook, reading the agent's hook payload as JSON "
+            'from stdin.'
+        )
+
+    def test_hook_usage_error_prints_short_usage_without_reading_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_registry_read() -> list[str]:
+            raise AssertionError('the hook registry was read')
+
+        monkeypatch.setattr('docwrap._hosts.registered_host_names', unexpected_registry_read)
+
+        status, stdout, stderr = invoke_cli(['hook'])
+
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: docwrap hook --agent NAME [options]\n'
+            'docwrap hook: error: the following arguments are required: -a/--agent\n'
+        )
 
 
 @pytest.mark.usefixtures('registered_hosts')
 class TestHookStdin:
-    def test_hook_avoids_cli_only_imports(self, distribution_root: Path) -> None:
-        src_dir = str(Path(__file__).resolve().parent.parent / 'src')
-        script = (
-            'import sys\n'
-            'from docwrap._cli import main\n'
-            "status = main(['hook', '--agent', 'claude'])\n"
-            'print(status)\n'
-            "print('docwrap._display' in sys.modules)\n"
-            "print('docwrap._stats' in sys.modules)\n"
+    def test_hook_fast_path_skips_engine_imports(
+        self, tmp_path: Path, distribution_root: Path
+    ) -> None:
+        payload = json.dumps(
+            {
+                'session_id': 'budget',
+                'transcript_path': '/dev/null',
+                'cwd': str(tmp_path),
+                'permission_mode': 'default',
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'ls -la'},
+                'tool_use_id': 'toolu_budget',
+            }
         )
+        src_dir = str(Path(__file__).resolve().parent.parent / 'src')
         result = run_setup(
-            [sys.executable, '-c', script],
-            stdin=b'{}',
+            [sys.executable, '-c', _BUDGET_SCRIPT],
+            stdin=payload.encode(),
             check=False,
             env={**os.environ, 'PYTHONPATH': os.pathsep.join([src_dir, str(distribution_root)])},
         )
-        assert result.returncode == 0, process_transcript(result)
-        assert result.stderr == b''
-        assert decode_text(result.stdout).splitlines() == ['0', 'False', 'False']
+        stderr = result.stderr.decode().replace('\r\n', '\n')
+        assert 'budget-status=0\n' in stderr, stderr
+        assert 'budget-loaded=\n' in stderr, stderr
 
     def test_stdin_ingestion(self, tmp_path: Path, distribution_root: Path) -> None:
         f = tmp_path / 'test.py'
@@ -1476,11 +1560,11 @@ class TestHookSubcommand:
 
     @pytest.mark.parametrize('flag', ['-a', '--agent'])
     def test_accepts_agent_selection(self, flag: str) -> None:
-        assert cli_mod._build_hook_parser().parse_args([flag, 'codex']).agent == 'codex'
+        assert front_mod._build_hook_parser().parse_args([flag, 'codex']).agent == 'codex'
 
     @pytest.mark.parametrize('flag', ['-e', '--event'])
     def test_accepts_event_selection(self, flag: str) -> None:
-        args = cli_mod._build_hook_parser().parse_args(['-a', 'agy', flag, 'PreToolUse'])
+        args = front_mod._build_hook_parser().parse_args(['-a', 'agy', flag, 'PreToolUse'])
         assert args.event == 'PreToolUse'
 
     def test_main_hook_allow_on_failure_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1499,7 +1583,7 @@ class TestHookSubcommand:
             captured['allow_on_failure'] = allow_on_failure
             return 0
 
-        monkeypatch.setattr('docwrap._hook.run_hook', tracking_run_hook)
+        monkeypatch.setattr('docwrap._hook_front.run_hook', tracking_run_hook)
         monkeypatch.setattr('sys.stdin', io.StringIO('{}'))
         main(['hook', '--agent', 'claude', '--allow-on-failure'])
         assert captured['allow_on_failure'] is True
@@ -1537,7 +1621,7 @@ class TestHookSubcommand:
             captured['incremental'] = incremental
             return 0
 
-        monkeypatch.setattr('docwrap._hook.run_hook', tracking_run_hook)
+        monkeypatch.setattr('docwrap._hook_front.run_hook', tracking_run_hook)
         monkeypatch.setattr('sys.stdin', io.StringIO('{}'))
         main(['hook', '--agent', 'claude', '-i'])
         assert captured['incremental'] is True
@@ -1565,7 +1649,7 @@ class TestHookSubcommand:
             captured['incremental'] = incremental
             return 0
 
-        monkeypatch.setattr('docwrap._hook.run_hook', tracking_run_hook)
+        monkeypatch.setattr('docwrap._hook_front.run_hook', tracking_run_hook)
         monkeypatch.setattr('sys.stdin', io.StringIO('{}'))
         main(['hook', '--agent', 'claude', '--no-incremental'])
         assert captured['incremental'] is False
@@ -1595,7 +1679,7 @@ class TestHookSubcommand:
     )
     def test_rejects_host_option(self, args: list[str]) -> None:
         with pytest.raises(SystemExit) as exc_info:
-            cli_mod._build_hook_parser().parse_args(args)
+            front_mod._build_hook_parser().parse_args(args)
         assert exc_info.value.code == 2
 
 
@@ -1741,7 +1825,7 @@ class TestIncrementalConfigPrecedence:
         f = tmp_path / 'foo.py'
         f.write_text('x = 1\n')
 
-        def unexpected_lookup(_path: Path) -> IncrementalLevel | bool | None:
+        def unexpected_lookup(_path: Path) -> IncrementalLevel | Literal[False] | None:
             raise AssertionError('incremental config lookup must be bypassed')
 
         monkeypatch.setattr(cli_mod, 'find_incremental_config', unexpected_lookup)
@@ -1763,7 +1847,7 @@ class TestIncrementalConfigPrecedence:
         f.write_text('x = 1\n')
         captured: dict[str, object] = {}
 
-        def configured_lookup(_path: Path) -> IncrementalLevel | bool | None:
+        def configured_lookup(_path: Path) -> IncrementalLevel | Literal[False] | None:
             return configured
 
         monkeypatch.setattr(cli_mod, 'find_incremental_config', configured_lookup)
@@ -1994,7 +2078,7 @@ class TestIncrementalErrors:
         captured = capsys.readouterr()
         assert exit_code == 2
         assert captured.out == ''
-        assert captured.err.startswith(f'error: {path}: ')
+        assert captured.err.startswith(f'error: {path.as_posix()}: ')
         assert expected_fragment in captured.err
         assert reads == {'count': 1}
 
@@ -2018,7 +2102,7 @@ class TestIncrementalErrors:
         captured = capsys.readouterr()
         assert exit_code == 2
         assert captured.out == ''
-        assert captured.err.startswith(f'error: {path}: ')
+        assert captured.err.startswith(f'error: {path.as_posix()}: ')
         assert 'invalid syntax' in captured.err
         downstream.assert_not_called()
 
@@ -2230,6 +2314,18 @@ class TestIncrementalPathScoping:
         assert main(['--write', '--incremental', str(target)]) == 0
         assert target.read_text() != _BODY_WRAPPABLE_SOURCE
 
+    @pytest.mark.parametrize('staged', [False, True])
+    def test_explicit_file_in_repository_without_commits_is_eligible(
+        self, tmp_path: Path, staged: bool
+    ) -> None:
+        run_setup(['git', 'init'], cwd=tmp_path)
+        target = tmp_path / 'new.py'
+        target.write_text(_BODY_WRAPPABLE_SOURCE)
+        if staged:
+            run_setup(['git', 'add', 'new.py'], cwd=tmp_path)
+        assert main(['--write', '--incremental', str(target)]) == 0
+        assert target.read_text() != _BODY_WRAPPABLE_SOURCE
+
     @pytest.mark.parametrize('level', ['definition', 'file'])
     def test_rename_preserves_unchanged_definition(
         self, tmp_path: Path, level: IncrementalLevel
@@ -2292,39 +2388,6 @@ class TestIncrementalPathScoping:
 
 
 class TestIncrementalRepositoryDiscovery:
-    @pytest.mark.parametrize('marker', ['directory', 'file'])
-    def test_nested_and_unrelated_worktrees_keep_distinct_roots(
-        self,
-        git_repo: Path,
-        tmp_path_factory: pytest.TempPathFactory,
-        monkeypatch: pytest.MonkeyPatch,
-        marker: str,
-    ) -> None:
-        nested = git_repo / 'nested'
-        unrelated = tmp_path_factory.mktemp('unrelated')
-        if marker == 'file':
-            run_setup(
-                ['git', 'worktree', 'add', '--detach', str(nested), 'HEAD'],
-                cwd=git_repo,
-            )
-        else:
-            nested.mkdir()
-            run_setup(['git', 'init'], cwd=nested)
-        run_setup(['git', 'init'], cwd=unrelated)
-        paths = [git_repo / 'top.py', nested / 'a.py', nested / 'sub' / 'b.py', unrelated / 'c.py']
-        (nested / 'sub').mkdir()
-        discover = Mock(wraps=cli_mod.discover_repo_root)
-        monkeypatch.setattr(cli_mod, 'discover_repo_root', discover)
-
-        roots, groups, failed = _discover_incremental_repositories(paths)
-
-        assert {
-            path: Path(root) if root is not None else None for path, root in roots.items()
-        } == dict(zip(paths, [git_repo, nested, nested, unrelated], strict=True))
-        assert list(map(Path, groups)) == [git_repo, nested, unrelated]
-        assert not failed
-        assert discover.call_count == 3
-
     def test_incremental_repo_discovery_error_keeps_configured_fallback(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2449,6 +2512,39 @@ class TestIncrementalRepositoryDiscovery:
         }
         assert by_root == {str(tmp_path): [first.resolve(), second.resolve()]}
         assert discovery_failed == set()
+
+    @pytest.mark.parametrize('marker', ['directory', 'file'])
+    def test_nested_and_unrelated_worktrees_keep_distinct_roots(
+        self,
+        git_repo: Path,
+        tmp_path_factory: pytest.TempPathFactory,
+        monkeypatch: pytest.MonkeyPatch,
+        marker: str,
+    ) -> None:
+        nested = git_repo / 'nested'
+        unrelated = tmp_path_factory.mktemp('unrelated')
+        if marker == 'file':
+            run_setup(
+                ['git', 'worktree', 'add', '--detach', str(nested), 'HEAD'],
+                cwd=git_repo,
+            )
+        else:
+            nested.mkdir()
+            run_setup(['git', 'init'], cwd=nested)
+        run_setup(['git', 'init'], cwd=unrelated)
+        paths = [git_repo / 'top.py', nested / 'a.py', nested / 'sub' / 'b.py', unrelated / 'c.py']
+        (nested / 'sub').mkdir()
+        discover = Mock(wraps=cli_mod.discover_repo_root)
+        monkeypatch.setattr(cli_mod, 'discover_repo_root', discover)
+
+        roots, groups, failed = _discover_incremental_repositories(paths)
+
+        assert {
+            path: Path(root) if root is not None else None for path, root in roots.items()
+        } == dict(zip(paths, [git_repo, nested, nested, unrelated], strict=True))
+        assert list(map(Path, groups)) == [git_repo, nested, unrelated]
+        assert not failed
+        assert discover.call_count == 3
 
     @pytest.mark.parametrize(
         'status', [RepoDiscoveryStatus.ERROR, RepoDiscoveryStatus.NOT_WORKTREE]
@@ -3201,6 +3297,33 @@ class TestNewlinePreservation:
         # After stripping \r\n pairs, no bare \n should remain
         assert raw.replace(b'\r\n', b'').count(b'\n') == 0
 
+    def test_failed_restore_is_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / 'test.py'
+        path.write_text(_BODY_WRAPPABLE_SOURCE)
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def failed_writes(candidate: Path, data: bytes) -> int:
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(candidate, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+                raise OSError('restore failed')
+            return original_write_bytes(candidate, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', failed_writes)
+
+        assert main(['-w', str(path)]) == 2
+        assert calls == 2
+        assert 'restoring the original bytes also failed' in capsys.readouterr().err
+
     def test_lf_preserved_on_write(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
         original = _BODY_WRAPPABLE_SOURCE.encode()
@@ -3210,6 +3333,34 @@ class TestNewlinePreservation:
         # Verify write actually changed the file (guards against no-op)
         assert raw != original
         assert b'\r\n' not in raw
+
+    def test_write_failure_restores_the_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / 'test.py'
+        raw = _BODY_WRAPPABLE_SOURCE.encode()
+        path.write_bytes(raw)
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def partial_write(candidate: Path, data: bytes) -> int:
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(candidate, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+            return original_write_bytes(candidate, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', partial_write)
+
+        assert main(['-w', str(path)]) == 2
+        assert calls == 2
+        assert path.read_bytes() == raw
+        assert capsys.readouterr().err.startswith('error: ')
 
 
 class TestPathDeduplication:
@@ -3908,7 +4059,7 @@ class TestReadyWriteReads:
             source: str,
             encoding: str,
             *,
-            raw: bytes | None = None,
+            raw: bytes,
         ) -> None:
             if candidate.resolve() == resolved:
                 writer_raw.append(raw)
@@ -4004,7 +4155,7 @@ class TestReportErrors:
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
         assert 'Name' in lines[0]
-        assert str(good) in lines[1]
+        assert good.as_posix() in lines[1]
         assert '1' in lines[1]  # 1 wrapped
         assert 'error' in captured.err  # error message for bad file
 
@@ -4050,7 +4201,7 @@ class TestSafetySkipStderr:
         code = main([str(f)])
         captured = capsys.readouterr()
         assert code == 0
-        assert f'{f}:2: skipme skipped (line-continuation):' in captured.err
+        assert f'{f.as_posix()}:2: skipme skipped (line-continuation):' in captured.err
 
     def test_hide_skips_does_not_hide_safety_warnings(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4088,7 +4239,7 @@ class TestSafetySkipStderr:
         code = main(['-w', str(f)])
         captured = capsys.readouterr()
         assert code == 0
-        assert f'{f}:2: skipme skipped (line-continuation):' in captured.err
+        assert f'{f.as_posix()}:2: skipme skipped (line-continuation):' in captured.err
         text = f.read_text()
         assert 'Line one ' + BACKSLASH + '\n' in text  # skipped docstring untouched
         assert 'definitely\n' in text  # other docstring wrapped
@@ -4146,7 +4297,7 @@ class TestSkippedSummariesOutput:
         main([str(f), '--no-wrap-summary', '-v'])
         captured = capsys.readouterr()
         assert 'Skip' in captured.out
-        assert str(f) in captured.out
+        assert f.as_posix() in captured.out
 
 
 class TestStatsEffectiveConfig:
@@ -4819,17 +4970,6 @@ class TestStatsMode:
         assert 'Recommended targets' in out
         assert 'Low churn' in out
 
-    def test_stats_skipped_footer(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        bad = tmp_path / 'bad.py'
-        bad.write_bytes(b'# coding: nosuchcodec\n')
-        good = tmp_path / 'good.py'
-        good.write_text('def foo():\n    """Short."""\n')
-        main([str(good), str(bad), '--stats'])
-        out = capsys.readouterr().out
-        assert 'Skipped 1 file (unreadable).' in out
-
     def test_stats_summary_shows_percentiles(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -4843,6 +4983,32 @@ class TestStatsMode:
         assert 'P90' in out
         assert 'P95' in out
         assert 'P99' in out
+
+    def test_stats_unparseable_file_is_reported_and_exits_two(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad = tmp_path / 'bad.py'
+        bad.write_text('def foo(:\n')
+        good = tmp_path / 'good.py'
+        good.write_text('def foo():\n    """Short."""\n')
+        exit_code = main([str(good), str(bad), '--stats'])
+        captured = capsys.readouterr()
+        assert exit_code == 2
+        assert 'Scanned: 1 docstring across 1 file' in captured.out
+        assert f'error: {bad.as_posix()}: failed to parse' in captured.err
+
+    def test_stats_unreadable_file_is_reported_and_exits_two(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad = tmp_path / 'bad.py'
+        bad.write_bytes(b'# coding: nosuchcodec\n')
+        good = tmp_path / 'good.py'
+        good.write_text('def foo():\n    """Short."""\n')
+        exit_code = main([str(good), str(bad), '--stats'])
+        captured = capsys.readouterr()
+        assert exit_code == 2
+        assert 'Skipped 1 file (unreadable).' in captured.out
+        assert f'error: {bad.as_posix()}: ' in captured.err
 
     def test_stats_zero_docstrings_early_exit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4928,8 +5094,8 @@ class TestSummaryMode:
         main([str(a), str(b), '-v'])
         captured = capsys.readouterr()
         # b.py has total=0 and no skips, so it should not appear
-        assert str(a) in captured.out
-        assert str(b) not in captured.out
+        assert a.as_posix() in captured.out
+        assert b.as_posix() not in captured.out
 
 
 class TestSummaryStartFlag:
@@ -4992,7 +5158,7 @@ class TestVerboseSummary:
         lines = captured.out.strip().splitlines()
         # With -v, header + data row shown even for unchanged file
         assert 'Name' in lines[0]
-        assert str(f) in lines[1]
+        assert f.as_posix() in lines[1]
         assert '0' in lines[1]  # 0 wrapped
 
     def test_verbose_includes_unchanged(
@@ -5007,8 +5173,8 @@ class TestVerboseSummary:
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
         # Both files shown with -v
-        assert any(str(a) in line for line in lines)
-        assert any(str(b) in line for line in lines)
+        assert any(a.as_posix() in line for line in lines)
+        assert any(b.as_posix() in line for line in lines)
 
 
 class TestVersion:
@@ -5183,26 +5349,24 @@ def _closed_stdout_result(case: str, tmp_path: Path) -> subprocess.CompletedProc
     return run_with_closed_output(['-d', str(target)])
 
 
-def _help_contains(help_text: str, substring: str) -> bool:
-    return ' '.join(substring.split()) in ' '.join(help_text.split())
+def _help_entries(
+    parser: argparse.ArgumentParser, prefix: str
+) -> Iterator[tuple[str, str | None]]:
+    for action in parser._actions:
+        if action.help is not argparse.SUPPRESS:
+            label = '/'.join(action.option_strings) or action.dest
+            yield f'{prefix} {label}', action.help
 
 
-def _help_section_options(help_text: str, heading: str) -> list[tuple[str, ...]]:
-    lines = help_text.splitlines()
-    start = lines.index(f'{heading}:') + 1
-    end = next(
-        (
-            index
-            for index, line in enumerate(lines[start:], start)
-            if line and not line.startswith(' ') and line.endswith(':')
-        ),
-        len(lines),
-    )
-    return [
-        tuple(re.findall(r'(?<![\w-])--?[a-z][a-z-]*', line))
-        for line in lines[start:end]
-        if line.startswith('  -')
-    ]
+def _help_sections(help_text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    body: list[str] = []
+    for line in help_text.splitlines():
+        if line.endswith(':') and not line.startswith((' ', 'usage:')):
+            body = sections.setdefault(line.removesuffix(':'), [])
+        else:
+            body.append(line)
+    return {title: ' '.join(' '.join(lines).split()) for title, lines in sections.items()}
 
 
 def _incremental_case_source(case: str) -> str:
@@ -5264,6 +5428,13 @@ def _no_tracked_files(_path: str, _paths: Collection[str]) -> set[str]:
 
 def _not_worktree(_path: str) -> RepoDiscoveryResult:
     return RepoDiscoveryResult(RepoDiscoveryStatus.NOT_WORKTREE)
+
+
+def _option_help(resolved: ResolvedConfig | None = None) -> dict[str, str | None]:
+    return {
+        '/'.join(action.option_strings) or action.dest: action.help
+        for action in _build_parser(resolved)._actions
+    }
 
 
 def _prepare_incremental_file_case(
@@ -5345,6 +5516,12 @@ def _prepare_invalid_file_level_case(
     return path, downstream
 
 
+def _starts_in_lowercase_style(text: str) -> bool:
+    first = text.split(maxsplit=1)[0]
+    is_acronym = first.upper() == first and any(character.isalpha() for character in first)
+    return text[0].islower() or is_acronym
+
+
 def _stats_location_counts(output: str) -> list[int]:
     counts: list[int] = []
     in_category = False
@@ -5357,3 +5534,21 @@ def _stats_location_counts(output: str) -> list[int]:
         elif line and not line.startswith(' '):
             in_category = False
     return counts
+
+
+def test_stdout_is_utf8_under_a_legacy_encoding(tmp_path: Path) -> None:
+    path = tmp_path / 'legacy.py'
+    path.write_text(
+        'def f():\n    """Summary.\n\n    ' + 'caf\u00e9 ' * 30 + '\n    """\n', encoding='utf-8'
+    )
+    env = {
+        **os.environ,
+        'PYTHONPATH': os.pathsep.join([str(ROOT), str(ROOT / 'src')]),
+        'PYTHONIOENCODING': 'ascii',
+        'PYTHONUTF8': '0',
+    }
+
+    result = run_cli(['-d', str(path)], env=env)
+
+    assert result.returncode == 1
+    assert 'caf\u00e9' in result.stdout

@@ -77,10 +77,11 @@ detail or a configuration field value is invalid.
 
 ## `docwrap.wrap_file_report(path, *, config=None, detail='summary', write=False) -> WrapReport`
 
-Wraps docstrings in a Python file. Reads the file respecting its encoding cookie, wraps docstrings,
-and optionally writes back in the original encoding with the
-[selected newline style](platform.md#files-and-encodings). When `config` is `None`, configuration
-is resolved from `pyproject.toml` (falling back to defaults).
+Wraps docstrings in a Python file. Reads the file respecting its encoding cookie and normalizes
+physical line endings to LF before wrapping. `WrapReport.source` uses LF even when the file uses
+CRLF or lone CR, including when no docstring changes. An optional write uses the original encoding
+and the [selected newline style](platform.md#files-and-encodings). When `config` is `None`,
+configuration is resolved from `pyproject.toml` (falling back to defaults).
 
 ```python
 import docwrap
@@ -220,7 +221,8 @@ ReflowMode = Literal['none', 'cautious', 'full']
 Controls how aggressively docwrap joins lines:
 
 - `'none'` -- Split-only. Lines under the limit are never joined.
-- `'cautious'` -- Joins only clearly mechanical breaks (mid-sentence, lowercase continuation).
+- `'cautious'` -- Joins adjacent prose lines across nonterminal breaks when the next line starts
+  with a letter, supported inline token, option, parenthesis, or quoted number.
 - `'full'` -- Joins all lines and reflows to fill the available width.
 
 ## `docwrap.FillStyle`

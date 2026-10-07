@@ -234,7 +234,6 @@ class TestFormatEntry:
         em = EntryMatch(name='x', type_ann='int', description='')
         result = self.style.format_entry(em, 'param')
         assert result == [':param int x:']
-        assert result[0] == result[0].rstrip()
 
     def test_param_strip_types(self) -> None:
         em = EntryMatch(name='x', type_ann='int', description='The value.')

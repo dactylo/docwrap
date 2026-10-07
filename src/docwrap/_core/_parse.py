@@ -20,7 +20,7 @@ _UNDERLINE_CHARS = frozenset('-=~')
 class Region:
     """A parsed region within a docstring.
 
-    Args:
+    Attributes:
         kind: Semantic region classification.
         text: Normalized region text.
         entry_match: Parsed structured-entry fields, when applicable.

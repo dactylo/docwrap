@@ -10,9 +10,9 @@ import warnings
 from collections.abc import Generator
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any, NamedTuple, cast, overload
+from typing import Any, Literal, NamedTuple, cast
 
-from docwrap._color import visible_controls
+from docwrap._color import path_text, visible_controls
 from docwrap._exceptions import DocwrapConfigWarning
 from docwrap._styles import get_styles
 from docwrap._types import (
@@ -36,22 +36,18 @@ from docwrap._types import (
     WrapOverrides,
 )
 
-_KNOWN_STATIC_KEYS = frozenset({'allow-on-failure', 'line-length', 'stats'})
+_KNOWN_STATIC_KEYS = frozenset({'line-length', 'stats'})
 _RENDER_CONFIG_WARNINGS = contextvars.ContextVar[bool](
     'docwrap_render_config_warnings', default=False
 )
 _STATS_KEYS = frozenset({'longest-per-category', 'sections'})
-
-type _FieldSpec = (
-    '_BoolField | _EnumField[str | None] | _IncrementalField | _IntField | _StyleAliasField'
-)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ResolvedConfig:
     """Internal resolution result composing public and operational settings.
 
-    Args:
+    Attributes:
         config: Public transformation configuration.
         allow_on_failure: Hook failure policy from `allow-on-failure`.
         color: Terminal color mode consumed by the CLI.
@@ -63,7 +59,7 @@ class ResolvedConfig:
     config: DocwrapConfig
     allow_on_failure: bool = False
     color: ColorMode = 'auto'
-    incremental: IncrementalLevel | bool | None = None
+    incremental: IncrementalLevel | Literal[False] | None = None
     line_length_source: LineLengthSource = LineLengthSource.DEFAULT
     show_skips: bool = False
 
@@ -72,7 +68,7 @@ class ResolvedConfig:
 class StatsConfig:
     """Resolved configuration for the human-readable stats report.
 
-    Args:
+    Attributes:
         sections: Selected body sections in display order.
         longest_per_category: Maximum longest-line rows per wrappable category.
     """
@@ -100,10 +96,10 @@ class _EnumField[T: str | None]:
 
 @dataclass(frozen=True, slots=True)
 class _IncrementalField:
-    """Spec for the incremental field (bool | level-string | None)."""
+    """Spec for the incremental field (False | level-string | None)."""
 
     key: str
-    default: IncrementalLevel | bool | None
+    default: IncrementalLevel | Literal[False] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +133,12 @@ class _ConfigFields(NamedTuple):
     summary_start: _EnumField[SummaryStart]
     reflow: _EnumField[ReflowMode]
     wrap_summary: _BoolField
+    allow_on_failure: _BoolField
 
 
 @functools.cache
 def _config_fields() -> _ConfigFields:
-    """Declarative spec of [tool.docwrap] fields consumed by _resolve_field."""
+    """Declare [tool.docwrap] field specs in configuration warning order."""
     _res = ResolvedConfig(config=DocwrapConfig())
     _cfg = _res.config
     return _ConfigFields(
@@ -180,6 +177,7 @@ def _config_fields() -> _ConfigFields:
             default=_cfg.reflow,
         ),
         wrap_summary=_BoolField('wrap-summary', default=_cfg.wrap_summary),
+        allow_on_failure=_BoolField('allow-on-failure', default=_res.allow_on_failure),
     )
 
 
@@ -225,13 +223,13 @@ def _load_tool_table(directory: Path) -> dict[str, Any] | None:
         with toml_path.open('rb') as f:
             data = tomllib.load(f)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as error:
-        _warn(f'invalid pyproject.toml {toml_path}: {error}, using defaults')
+        _warn(f'invalid pyproject.toml {path_text(toml_path)}: {error}, using defaults')
         return None
     tool_raw = data.get('tool')
     if tool_raw is None:
         return None
     if not isinstance(tool_raw, dict):
-        _warn(f'invalid [tool] value {tool_raw!r} in {toml_path}, using defaults')
+        _warn(f'invalid [tool] value {tool_raw!r} in {path_text(toml_path)}, using defaults')
         return None
     return cast('dict[str, Any]', tool_raw)
 
@@ -265,8 +263,8 @@ def _resolve_incremental_field(
     spec: _IncrementalField,
     *,
     warn: bool = True,
-) -> IncrementalLevel | bool | None:
-    """Resolve the incremental field (bool | level-string | None)."""
+) -> IncrementalLevel | Literal[False] | None:
+    """Resolve the incremental field (False | level-string | None)."""
     raw: object = dw.get(spec.key)
     if raw is None:
         return spec.default
@@ -382,47 +380,6 @@ def _resolve_style_alias_field(
     return spec.default
 
 
-@overload
-def _resolve_field(tool: dict[str, Any], spec: _BoolField) -> bool: ...
-
-
-@overload
-def _resolve_field[T: str | None](tool: dict[str, Any], spec: _EnumField[T]) -> T: ...
-
-
-@overload
-def _resolve_field(
-    tool: dict[str, Any], spec: _IncrementalField
-) -> IncrementalLevel | bool | None: ...
-
-
-@overload
-def _resolve_field(tool: dict[str, Any], spec: _IntField) -> int: ...
-
-
-@overload
-def _resolve_field(tool: dict[str, Any], spec: _StyleAliasField) -> StyleName | None: ...
-
-
-def _resolve_field(
-    tool: dict[str, Any], spec: _FieldSpec
-) -> IncrementalLevel | StyleName | bool | int | str | None:
-    """Resolve one [tool.docwrap] field according to its spec."""
-    docwrap = tool.get('docwrap')
-    if not isinstance(docwrap, dict):
-        return spec.default
-    dw = cast('dict[str, Any]', docwrap)
-    if isinstance(spec, _BoolField):
-        return _resolve_bool_field(dw, spec)
-    if isinstance(spec, _EnumField):
-        return _resolve_enum_field(dw, spec)
-    if isinstance(spec, _IntField):
-        return _resolve_int_field(dw, spec)
-    if isinstance(spec, _StyleAliasField):
-        return _resolve_style_alias_field(dw, spec)
-    return _resolve_incremental_field(dw, spec)
-
-
 @functools.cache
 def _find_config_cached(directory: Path) -> ResolvedConfig:
     """Cached config resolution keyed by resolved directory."""
@@ -431,27 +388,29 @@ def _find_config_cached(directory: Path) -> ResolvedConfig:
         return ResolvedConfig(config=DocwrapConfig())
 
     docwrap_raw = tool.get('docwrap')
-    if docwrap_raw is not None and not isinstance(docwrap_raw, dict):
-        _warn(f'invalid [tool.docwrap] value {docwrap_raw!r}, using defaults')
-    elif isinstance(docwrap_raw, dict):
-        dw_keys = cast('dict[str, Any]', docwrap_raw).keys()
-        for key in sorted(dw_keys - _known_docwrap_keys()):
+    if isinstance(docwrap_raw, dict):
+        dw = cast('dict[str, Any]', docwrap_raw)
+        for key in sorted(dw.keys() - _known_docwrap_keys()):
             _warn(f'unknown [tool.docwrap].{key}, ignoring')
+    else:
+        dw = {}
+        if docwrap_raw is not None:
+            _warn(f'invalid [tool.docwrap] value {docwrap_raw!r}, using defaults')
 
     line_length, line_length_source = _resolve_line_length(tool)
     specs = _config_fields()
-    color = _resolve_field(tool, specs.color)
-    convert = _resolve_field(tool, specs.convert)
-    fill_style = _resolve_field(tool, specs.fill_style)
-    incremental = _resolve_field(tool, specs.incremental)
-    smart_slack = _resolve_field(tool, specs.smart_slack)
-    show_skips = _resolve_field(tool, specs.show_skips)
-    strip_types = _resolve_field(tool, specs.strip_types)
-    style = _resolve_field(tool, specs.style)
-    summary_start = _resolve_field(tool, specs.summary_start)
-    reflow = _resolve_field(tool, specs.reflow)
-    wrap_summary = _resolve_field(tool, specs.wrap_summary)
-    allow = _resolve_field(tool, _BoolField('allow-on-failure', default=False))
+    color = _resolve_enum_field(dw, specs.color)
+    convert = _resolve_enum_field(dw, specs.convert)
+    fill_style = _resolve_enum_field(dw, specs.fill_style)
+    incremental = _resolve_incremental_field(dw, specs.incremental)
+    smart_slack = _resolve_int_field(dw, specs.smart_slack)
+    show_skips = _resolve_bool_field(dw, specs.show_skips)
+    strip_types = _resolve_bool_field(dw, specs.strip_types)
+    style = _resolve_style_alias_field(dw, specs.style)
+    summary_start = _resolve_enum_field(dw, specs.summary_start)
+    reflow = _resolve_enum_field(dw, specs.reflow)
+    wrap_summary = _resolve_bool_field(dw, specs.wrap_summary)
+    allow = _resolve_bool_field(dw, specs.allow_on_failure)
 
     return ResolvedConfig(
         config=DocwrapConfig(
@@ -543,7 +502,7 @@ def find_config(path: Path) -> ResolvedConfig:
 
 def find_incremental_config(
     start: Path | None = None,
-) -> IncrementalLevel | bool | None:
+) -> IncrementalLevel | Literal[False] | None:
     """Read only the incremental config from `pyproject.toml`.
 
     Args:

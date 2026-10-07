@@ -30,6 +30,7 @@ from docwrap._types import (
 if TYPE_CHECKING:
     from docwrap._core._discover import ParsedDocstring
 
+VERBATIM_REGION_KINDS = frozenset({'code_block', 'section_header', 'title'})
 _ASCII_WHITESPACE = ' \t'
 _BALANCED_CANDIDATE_BUDGET = 100_000
 _BODY_SKIP_KINDS = frozenset({'summary', 'blank'})
@@ -52,7 +53,7 @@ type _PlanValidator = Callable[[list[str], _FillPlan], tuple[int, ...]]
 class WrapState:
     """Mutable state accumulated while wrapping docstrings in one source.
 
-    Args:
+    Attributes:
         changes: Per-docstring change records accumulated during wrapping.
         detected_styles: Style names detected in processed docstrings.
         converted_count: Number of docstrings converted between styles.
@@ -127,9 +128,8 @@ class _RenderedLine:
 class _SummaryOptions:
     """Scalar layout inputs for marker-aware summary rendering."""
 
-    fill_style: FillStyle
+    fill: _FillOptions
     quote_overhead: int
-    smart_slack: int
     width: int
 
 
@@ -397,15 +397,14 @@ def _is_bare_summary_marker(line: str) -> bool:
     return line == line.strip() and LIST_RE.fullmatch(f'{line} ') is not None
 
 
-def _is_conservative_google_entry_candidate(line: str, ctx: _WrapCtx) -> bool:
-    """Recognize candidate Google colon prefixes at the entry indent."""
-    if ctx.style is None or ctx.style.name != 'google':
+def _is_conservative_entry_candidate(line: str, ctx: _WrapCtx) -> bool:
+    """Ask the style whether a line at entry indent could become an entry."""
+    if ctx.style is None:
         return False
     indent = len(line) - len(line.lstrip())
     if indent != ctx.section_body_indent:
         return False
-    prefix, separator, _ = line[indent:].partition(':')
-    return bool(separator and prefix.strip())
+    return ctx.style.is_conservative_entry_candidate(line[indent:])
 
 
 def _is_semantically_joinable(line_a: str, line_b: str) -> bool:
@@ -845,8 +844,7 @@ def _fill(  # noqa: PLR0913
     *,
     initial: str = '',
     subsequent: str | None = None,
-    fill_style: FillStyle = 'smart',
-    smart_slack: int = 8,
+    options: _FillOptions,
     validator: _PlanValidator | None = None,
 ) -> str:
     """Fill text using the configured line-breaking strategy."""
@@ -854,7 +852,9 @@ def _fill(  # noqa: PLR0913
     fill_words = _split_fill_words(text)
     if not fill_words.normalized:
         return ''
-    preserve_leading = fill_style == 'greedy' or (fill_style == 'smart' and smart_slack == 0)
+    preserve_leading = options.fill_style == 'greedy' or (
+        options.fill_style == 'smart' and options.smart_slack == 0
+    )
     first_capacity = width - len(initial)
     if (
         preserve_leading
@@ -871,10 +871,6 @@ def _fill(  # noqa: PLR0913
     if len(fill_words.normalized) <= width - len(initial):
         return initial + fill_words.normalized
 
-    options = _FillOptions(
-        fill_style=fill_style,
-        smart_slack=smart_slack,
-    )
     _, _, lines = _stabilize_fill_plan(
         fill_words,
         width,
@@ -920,8 +916,7 @@ def _cautious_reflow(  # noqa: C901
             width,
             initial=first.initial,
             subsequent=first.subsequent,
-            fill_style=options.fill_style,
-            smart_slack=options.smart_slack,
+            options=options,
         )
         return filled.split('\n')
 
@@ -983,8 +978,7 @@ def _emit_chunks(chunks: list[_Chunk], width: int, options: _FillOptions) -> lis
                 width,
                 initial=chunk.initial,
                 subsequent=chunk.subsequent,
-                fill_style=options.fill_style,
-                smart_slack=options.smart_slack,
+                options=options,
             )
             result.extend(filled.split('\n'))
     return result
@@ -1071,8 +1065,7 @@ def _wrap_entry_continuation(  # noqa: PLR0913
     width: int,
     style: Style,
     *,
-    fill_style: FillStyle,
-    smart_slack: int,
+    options: _FillOptions,
     reflow: ReflowMode = 'full',
     original_lines: tuple[str, ...] | None = None,
 ) -> list[str]:
@@ -1091,7 +1084,6 @@ def _wrap_entry_continuation(  # noqa: PLR0913
             )
             for line in original_lines[1:]
         ]
-        options = _FillOptions(fill_style=fill_style, smart_slack=smart_slack)
         result = _emit_reflowed_chunks(chunks, width, options, reflow)
         if result is not None:
             return [first_line, *result]
@@ -1102,8 +1094,7 @@ def _wrap_entry_continuation(  # noqa: PLR0913
         width,
         initial=cont_indent,
         subsequent=cont_indent,
-        fill_style=fill_style,
-        smart_slack=smart_slack,
+        options=options,
     )
     return [first_line, *wrapped.split('\n')]
 
@@ -1114,9 +1105,8 @@ def _wrap_entry(  # noqa: PLR0913
     style: Style,
     entry_match: EntryMatch | None = None,
     *,
-    fill_style: FillStyle,
+    options: _FillOptions,
     role: CanonicalRole | SphinxFieldRole | Literal[''] = '',
-    smart_slack: int,
     reflow: ReflowMode = 'full',
     original_lines: tuple[str, ...] | None = None,
 ) -> list[str]:
@@ -1129,7 +1119,6 @@ def _wrap_entry(  # noqa: PLR0913
     if em is not None and original_lines is not None and reflow != 'full':
         chunks = _entry_chunks(original_lines, style, role)
         if chunks is not None:
-            options = _FillOptions(fill_style=fill_style, smart_slack=smart_slack)
             result = _emit_reflowed_chunks(chunks, width, options, reflow)
             if result is not None:
                 return result
@@ -1162,8 +1151,7 @@ def _wrap_entry(  # noqa: PLR0913
             width,
             initial=marker,
             subsequent=hanging,
-            fill_style=fill_style,
-            smart_slack=smart_slack,
+            options=options,
         )
         return wrapped.split('\n')
 
@@ -1172,8 +1160,7 @@ def _wrap_entry(  # noqa: PLR0913
         lines[1:],
         width,
         style,
-        fill_style=fill_style,
-        smart_slack=smart_slack,
+        options=options,
         reflow=reflow,
         original_lines=original_lines,
     )
@@ -1188,20 +1175,18 @@ def _wrap_entry_region(region: Region, ctx: _WrapCtx) -> list[str]:
         ctx.width,
         ctx.style,
         entry_match=region.entry_match,
-        fill_style=ctx.config.fill_style,
+        options=_FillOptions(ctx.config.fill_style, ctx.config.smart_slack),
         role=region.role,
-        smart_slack=ctx.config.smart_slack,
         reflow=ctx.config.reflow,
         original_lines=region.original_lines,
     )
 
 
-def _wrap_list_item(  # noqa: PLR0913
+def _wrap_list_item(
     text: str,
     width: int,
     *,
-    fill_style: FillStyle,
-    smart_slack: int,
+    options: _FillOptions,
     reflow: ReflowMode = 'full',
     original_lines: tuple[str, ...] | None = None,
 ) -> list[str]:
@@ -1211,11 +1196,6 @@ def _wrap_list_item(  # noqa: PLR0913
         return [text]
     prefix = m.group(0)
     hanging = ' ' * len(prefix)
-    options = _FillOptions(
-        fill_style=fill_style,
-        smart_slack=smart_slack,
-    )
-
     if original_lines is not None and reflow != 'full':
         chunks, _, _ = _list_chunks(original_lines)
         result = _emit_reflowed_chunks(chunks, width, options, reflow)
@@ -1238,8 +1218,7 @@ def _wrap_list_item(  # noqa: PLR0913
         width,
         initial=prefix,
         subsequent=hanging,
-        fill_style=options.fill_style,
-        smart_slack=options.smart_slack,
+        options=options,
     )
     return wrapped.split('\n')
 
@@ -1249,8 +1228,7 @@ def _wrap_list_item_region(region: Region, ctx: _WrapCtx) -> list[str]:
     return _wrap_list_item(
         region.text,
         ctx.width,
-        fill_style=ctx.config.fill_style,
-        smart_slack=ctx.config.smart_slack,
+        options=_FillOptions(ctx.config.fill_style, ctx.config.smart_slack),
         reflow=ctx.config.reflow,
         original_lines=region.original_lines,
     )
@@ -1259,16 +1237,14 @@ def _wrap_list_item_region(region: Region, ctx: _WrapCtx) -> list[str]:
 def _wrap_paragraph(region: Region, ctx: _WrapCtx, indent: str) -> list[str]:
     """Wrap a paragraph region with the given indent prefix."""
     hanging = indent
+    options = _FillOptions(ctx.config.fill_style, ctx.config.smart_slack)
     if ctx.style is None and FIELD_MARKER_RE.match(region.text):
         hanging = indent + ' ' * _SPHINX_FALLBACK_HANGING
     if region.original_lines is not None and ctx.config.reflow != 'full':
         result = _emit_reflowed_chunks(
             _para_chunks(region.original_lines, region.indent, indent, hanging=hanging),
             ctx.width,
-            _FillOptions(
-                fill_style=ctx.config.fill_style,
-                smart_slack=ctx.config.smart_slack,
-            ),
+            options,
             ctx.config.reflow,
         )
         if result is not None:
@@ -1278,8 +1254,7 @@ def _wrap_paragraph(region: Region, ctx: _WrapCtx, indent: str) -> list[str]:
         ctx.width,
         initial=indent,
         subsequent=hanging,
-        fill_style=ctx.config.fill_style,
-        smart_slack=ctx.config.smart_slack,
+        options=options,
     ).split('\n')
 
 
@@ -1322,8 +1297,7 @@ def _wrap_summary_fragment(
         options.width,
         initial=fake_indent,
         subsequent='',
-        fill_style=options.fill_style,
-        smart_slack=options.smart_slack,
+        options=options.fill,
         validator=validate_summary_plan,
     )
     lines = wrapped.split('\n')
@@ -1365,9 +1339,8 @@ def _wrap_summary_region(region: Region, ctx: _WrapCtx) -> list[str]:
     return _render_wrapped_summary_lines(
         region,
         _SummaryOptions(
-            fill_style=ctx.config.fill_style,
+            fill=_FillOptions(ctx.config.fill_style, ctx.config.smart_slack),
             quote_overhead=ctx.quote_overhead,
-            smart_slack=ctx.config.smart_slack,
             width=ctx.width,
         ),
     )
@@ -1384,7 +1357,7 @@ def _wrap_region(region: Region, ctx: _WrapCtx, indent_delta: int) -> list[str]:
         match region.kind:
             case 'blank':
                 wrapped = ['']
-            case 'code_block' | 'section_header' | 'title':
+            case kind if kind in VERBATIM_REGION_KINDS:
                 wrapped = [region.text]
             case 'description':
                 wrapped = _wrap_description(region, ctx)
@@ -1396,6 +1369,8 @@ def _wrap_region(region: Region, ctx: _WrapCtx, indent_delta: int) -> list[str]:
                 wrapped = _wrap_prose(region, ctx, indent_delta)
             case 'summary':
                 wrapped = _wrap_summary_region(region, ctx)
+            case _:
+                raise ValueError(f'Unknown region kind: {region.kind}')
     return wrapped
 
 
@@ -1426,7 +1401,7 @@ def _candidate_run_gains_entry_shape(
         ]
         if any(
             ctx.style.match_entry(line, role=role) is not None
-            or _is_conservative_google_entry_candidate(line, ctx)
+            or _is_conservative_entry_candidate(line, ctx)
             for line in candidate_lines
         ):
             return True
@@ -1566,7 +1541,7 @@ def compute_quote_overhead(parsed: 'ParsedDocstring', config: DocwrapConfig) -> 
 
     Args:
         parsed: Parsed docstring with prefix metadata.
-        config: Docwrap configuration carrying summary_start.
+        config: docwrap configuration carrying summary_start.
 
     Returns:
         0 when the summary starts on its own (second) line; otherwise the
@@ -1613,7 +1588,7 @@ def detect_summary_skip(
             )
             if summary_line_width > config.line_length:
                 return True, summary_line_width
-            # For summary-only docstrings, _reassemble uses a one-liner which
+            # For summary-only docstrings, reassemble uses a one-liner which
             # also includes closing quotes.  Check that width too.
             if not _has_body_regions(regions) and len(summary_lines) == 1:
                 oneliner_width = summary_line_width + TRIPLE_QUOTE_LEN

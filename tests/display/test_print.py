@@ -18,7 +18,7 @@ class TestPrintPreview:
 
         output = _format_preview([result], color=True)
 
-        path = str(Path('dir\x1b/file\t.py')).replace('\x1b', r'\x1b').replace('\t', r'\x09')
+        path = Path('dir\x1b/file\t.py').as_posix().replace('\x1b', r'\x1b').replace('\t', r'\x09')
         assert f'{BOLD}{path}:3:Thing\\x0dmethod\\x9b{RESET}' in output
         assert f'{RED}  before:\nold\\x09line\nnext\\x7f{RESET}' in output
         assert f'{GREEN}  after:\nnew\\x00line\né{RESET}' in output

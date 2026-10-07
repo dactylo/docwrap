@@ -1,6 +1,6 @@
 # Concepts and safety
 
-Docwrap makes docstring formatting a repeatable project policy. As people and coding agents write
+docwrap makes docstring formatting a repeatable project policy. As people and coding agents write
 and edit docstrings, it applies configured rules for wrapping and layout while preserving
 recognized structure. It supports Google, NumPy, and Sphinx/reST conventions. Use the
 [CLI reference](cli.md) to choose an output mode, the [library reference](library.md) to call it
@@ -8,15 +8,15 @@ from Python, or the [agent hook guide](hook.md) to run it around edits and commi
 
 ## What docwrap changes
 
-Docwrap distinguishes a summary, prose paragraphs, structured entries such as arguments and
+docwrap distinguishes a summary, prose paragraphs, structured entries such as arguments and
 returns, lists, and text that must stay verbatim. It wraps prose and descriptions to the configured
 width with the indentation required by the detected style. Section headings, code examples,
 doctests, literal blocks, tables, and aligned code-labelled listings retain their layout. The
 [CLI statistics view](cli.md#stats-mode---stats) can help you choose a width from the existing
 source and docstrings.
 
-A file can contain different docstring styles. Docwrap detects each docstring independently, and
-`style = "google"` (or `numpy` or `sphinx`) can supply a convention when detection is uncertain.
+A file can contain different docstring styles. docwrap detects each docstring independently, unless
+`style = "google"` (or `numpy` or `sphinx`) applies that convention to every docstring instead.
 When style markers tie, ordinary wrapping leaves the style undetected and wraps only content that
 does not require a style choice. Explicit [style conversion](cli.md#style-conversion) has different
 tie handling and may keep unsupported sections in their original style.
@@ -62,7 +62,7 @@ entirely on one line stays on one line before that preference applies.
 
 ## Preservation and safety
 
-Docwrap uses Python syntax to locate docstrings, leaving ordinary strings and code alone. The
+docwrap uses Python syntax to locate docstrings, leaving ordinary strings and code alone. The
 source-string API preserves untouched text and final line terminators. File writes retain the
 detected encoding but select one newline style for rewritten files, as described under
 [platform compatibility](platform.md). When docwrap rewrites a docstring, it keeps the literal's

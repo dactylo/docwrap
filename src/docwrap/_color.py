@@ -1,6 +1,7 @@
 """ANSI color support for CLI output."""
 
 import os
+from pathlib import PurePath, PureWindowsPath
 from typing import TextIO
 
 from docwrap._types import ColorMode
@@ -45,6 +46,22 @@ def bold_if(text: str, color: bool) -> str:
         text.
     """
     return colorize(text, BOLD) if color else text
+
+
+def path_text(path: str | PurePath) -> str:
+    """Render ordinary Windows path separators as forward slashes.
+
+    Preserve the supplied spelling of POSIX paths and Windows device or
+    extended-length namespaces. String paths use the current platform's path
+    flavor. This does not escape terminal controls or quote for a shell.
+    """
+    text = str(path)
+    native = PurePath(path) if isinstance(path, str) else path
+    if isinstance(native, PureWindowsPath) and not text.replace('/', '\\').startswith(
+        ('\\\\?\\', '\\\\.\\', '\\??\\')
+    ):
+        return text.replace('\\', '/')
+    return text
 
 
 def percentile_color(value: int, limit: int | None) -> str | None:

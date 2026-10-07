@@ -6,12 +6,20 @@ from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from docwrap._files import decode_python_source, detect_newline, encode_with_newline
-from docwrap._git_utils import decode_git_quoted_path, git_executable
-from docwrap._shell import normalize_msys_path
-from docwrap._types import BaselineResult, BaselineStatus, Newline, PreCommitAdd
+from docwrap._git_utils import (
+    decode_git_quoted_path,
+    git_executable,
+    git_failure_detail,
+    run_git_command_bytes,
+)
+from docwrap._types import BaselineResult, BaselineStatus, Newline
+from docwrap._vendor.hookshell._shell import normalize_msys_path
+
+if TYPE_CHECKING:
+    from docwrap._vendor.hookshell._grammar import PreCommitAdd
 
 _CAT_FILE_HEADER_FIELD_COUNT = 3
 _GIT_RAW_DIFF_FIELD_COUNT = 5
@@ -21,7 +29,7 @@ _REGULAR_FILE_MODES = frozenset(('100644', '100755'))
 class IndexEntry(NamedTuple):
     """Prepared Git index update.
 
-    Args:
+    Attributes:
         mode: Git file mode for the index entry.
         blob_hash: Object ID of the prepared blob.
         path: Repository-relative path to update.
@@ -44,24 +52,6 @@ class RepoDiscoveryStatus(Enum):
     WORKTREE = 'worktree'
     NOT_WORKTREE = 'not_worktree'
     ERROR = 'error'
-
-
-class StagedFileInfo(NamedTuple):
-    """Information about a staged file from `git diff --cached --raw`.
-
-    Args:
-        path: Repository-relative staged path.
-        mode: New Git file mode.
-        blob_hash: New staged object ID.
-        old_hash: Previous object ID.
-        status: Git raw-diff status code.
-    """
-
-    path: str
-    mode: str
-    blob_hash: str
-    old_hash: str
-    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +79,24 @@ class RepoDiscoveryResult:
         has_root = bool(self.root)
         if (self.status is RepoDiscoveryStatus.WORKTREE) is not has_root:
             raise ValueError('invalid repository discovery result')
+
+
+class StagedFileInfo(NamedTuple):
+    """Information about a staged file from `git diff --cached --raw`.
+
+    Attributes:
+        path: Repository-relative staged path.
+        mode: New Git file mode.
+        blob_hash: New staged object ID.
+        old_hash: Previous object ID.
+        status: Git raw-diff status code.
+    """
+
+    path: str
+    mode: str
+    blob_hash: str
+    old_hash: str
+    status: str
 
 
 def _decode_git_pathspec_record(record: bytes) -> bytes | None:
@@ -276,6 +284,43 @@ def _collect_pathspecs(
     return all_pathspecs
 
 
+def _resolve_git_pathspecs(
+    cwd: str,
+    pathspecs: list[str] | None,
+    repo_root: str,
+) -> list[str] | None:
+    """Resolve prepared pathspecs to tracked Python files through Git."""
+    if pathspecs is None:
+        return None
+    if not pathspecs:
+        return []
+
+    result = run_git_command_bytes(
+        [
+            'git',
+            'ls-files',
+            '-z',
+            '--full-name',
+            '--',
+            *(os.fsencode(pathspec) for pathspec in pathspecs),
+        ],
+        cwd,
+    )
+    if result is None or result.returncode != 0:
+        return None
+
+    py_paths: list[str] = []
+    for name_bytes in result.stdout.split(b'\0'):
+        if not name_bytes or not name_bytes.endswith(b'.py'):
+            continue
+        name = os.fsdecode(name_bytes)
+        full_path = Path(repo_root) / name
+        if full_path.exists() and not full_path.is_symlink():
+            py_paths.append(name)
+
+    return sorted(py_paths)
+
+
 def _run_git_command(
     args: list[str],
     cwd: str | None = None,
@@ -316,65 +361,6 @@ def _git_config_bool(key: str, cwd: str | None = None) -> bool | None:
     return None
 
 
-def _run_git_command_bytes(
-    args: list[str | bytes],
-    cwd: str,
-    *,
-    stdin: bytes | None = None,
-) -> subprocess.CompletedProcess[bytes] | None:
-    """Run a binary-mode git command with standard capture settings."""
-    try:
-        executable = git_executable()
-        if executable is None:
-            return None
-        return subprocess.run(  # noqa: S603
-            [executable, *args[1:]],
-            input=stdin,
-            capture_output=True,
-            cwd=cwd,
-            check=False,
-        )
-    except (OSError, ValueError):
-        return None
-
-
-def _resolve_git_pathspecs(
-    cwd: str,
-    pathspecs: list[str] | None,
-    repo_root: str,
-) -> list[str] | None:
-    """Resolve prepared pathspecs to tracked Python files through Git."""
-    if pathspecs is None:
-        return None
-    if not pathspecs:
-        return []
-
-    result = _run_git_command_bytes(
-        [
-            'git',
-            'ls-files',
-            '-z',
-            '--full-name',
-            '--',
-            *(os.fsencode(pathspec) for pathspec in pathspecs),
-        ],
-        cwd,
-    )
-    if result is None or result.returncode != 0:
-        return None
-
-    py_paths: list[str] = []
-    for name_bytes in result.stdout.split(b'\0'):
-        if not name_bytes or not name_bytes.endswith(b'.py'):
-            continue
-        name = os.fsdecode(name_bytes)
-        full_path = Path(repo_root) / name
-        if full_path.exists() and not full_path.is_symlink():
-            py_paths.append(name)
-
-    return sorted(py_paths)
-
-
 def apply_index_entries(cwd: str, entries: list[IndexEntry]) -> bool:
     """Atomically update multiple index entries.
 
@@ -396,7 +382,7 @@ def apply_index_entries(cwd: str, entries: list[IndexEntry]) -> bool:
         + b'\0'
         for e in entries
     )
-    result = _run_git_command_bytes(
+    result = run_git_command_bytes(
         ['git', 'update-index', '-z', '--index-info'],
         cwd,
         stdin=stdin_data,
@@ -435,7 +421,7 @@ def discover_repo_root(cwd: str) -> RepoDiscoveryResult:
     Returns:
         Explicit worktree, non-worktree, or infrastructure-error result.
     """
-    result = _run_git_command_bytes(['git', 'rev-parse', '--show-toplevel'], cwd)
+    result = run_git_command_bytes(['git', 'rev-parse', '--show-toplevel'], cwd)
 
     if result is None:
         return RepoDiscoveryResult(RepoDiscoveryStatus.ERROR)
@@ -483,7 +469,7 @@ def get_modified_tracked_py_files(cwd: str) -> list[str] | None:
         else _get_empty_tree_hash(cwd)
     )
 
-    result = _run_git_command_bytes(
+    result = run_git_command_bytes(
         [
             'git',
             'diff',
@@ -519,6 +505,8 @@ def get_repo_diff(
         'core.quotePath=false',
         'diff',
         '--no-color',
+        '--no-ext-diff',
+        '--no-textconv',
         '--src-prefix=a/',
         '--dst-prefix=b/',
         '-U0',
@@ -528,30 +516,10 @@ def get_repo_diff(
     if cached:
         cmd.append('--cached')
     cmd.extend(['HEAD', '--'])
-    result = _run_git_command_bytes(cmd, repo_root)
+    result = run_git_command_bytes(cmd, repo_root)
     if result is None or result.returncode != 0:
         return None
     return _decode_git_text(result.stdout)
-
-
-def get_repo_root(cwd: str) -> str:
-    """Resolve the git repository root directory.
-
-    Args:
-        cwd: Directory from which Git should resolve the repository root.
-
-    Returns:
-        The `git rev-parse --show-toplevel` output, or `cwd` on failure.
-    """
-    result = _run_git_command_bytes(
-        ['git', 'rev-parse', '--show-toplevel'],
-        cwd,
-    )
-    if result is not None and result.returncode == 0:
-        root = os.fsdecode(result.stdout.removesuffix(b'\n'))
-        if root:
-            return normalize_msys_path(root)
-    return cwd
 
 
 def get_staged_py_info(cwd: str) -> list[StagedFileInfo] | None:
@@ -563,7 +531,7 @@ def get_staged_py_info(cwd: str) -> list[StagedFileInfo] | None:
     Returns:
         Sorted staged Python file metadata, or `None` on Git failure.
     """
-    result = _run_git_command_bytes(
+    result = run_git_command_bytes(
         [
             'git',
             'diff',
@@ -611,7 +579,7 @@ def get_tracked_files(repo_root: str, paths: Collection[str]) -> set[str] | None
     """
     if not paths:
         return set()
-    result = _run_git_command_bytes(
+    result = run_git_command_bytes(
         [
             'git',
             'ls-files',
@@ -627,6 +595,23 @@ def get_tracked_files(repo_root: str, paths: Collection[str]) -> set[str] | None
     )
 
 
+def is_head_unborn(cwd: str) -> bool:
+    """Report whether `HEAD` names a branch that has no commits yet.
+
+    Args:
+        cwd: Working directory for Git commands.
+
+    Returns:
+        `True` only when Git confirms an unborn branch; `False` for any other
+        state, including Git failure.
+    """
+    branch = _run_git_command(['git', 'symbolic-ref', '--quiet', 'HEAD'], cwd)
+    if branch is None or branch.returncode != 0:
+        return False
+    head = _run_git_command(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], cwd)
+    return head is not None and head.returncode == 1
+
+
 def is_hook_enabled(cwd: str | None = None) -> bool:
     """Check if the docwrap hook is enabled via git config.
 
@@ -640,11 +625,7 @@ def is_hook_enabled(cwd: str | None = None) -> bool:
     Returns:
         The configured hook state, defaulting to `True` when unset.
     """
-    enabled = (
-        _git_config_bool('docwrap.hook')
-        if cwd is None
-        else _git_config_bool('docwrap.hook', cwd=cwd)
-    )
+    enabled = _git_config_bool('docwrap.hook', cwd=cwd)
     return True if enabled is None else enabled
 
 
@@ -670,7 +651,7 @@ def prepare_index_entry(  # noqa: PLR0913
     Returns:
         The prepared index entry, or `None` on Git failure.
     """
-    hash_result = _run_git_command_bytes(
+    hash_result = run_git_command_bytes(
         ['git', 'hash-object', '-w', '--stdin'],
         cwd,
         stdin=encode_with_newline(content, encoding, newline),
@@ -697,7 +678,7 @@ def read_staged_blobs(
         return {}
 
     input_data = ('\n'.join(info.blob_hash for info in info_list) + '\n').encode()
-    proc = _run_git_command_bytes(
+    proc = run_git_command_bytes(
         ['git', 'cat-file', '--batch'],
         cwd,
         stdin=input_data,
@@ -737,28 +718,17 @@ def resolve_pathspec_py_files(
     return _resolve_git_pathspecs(cwd, collected, repo_root)
 
 
-def run_pre_commit_adds(adds: tuple[PreCommitAdd, ...]) -> bool:
-    """Replay preceding git adds and report whether every add succeeded.
+def run_pre_commit_adds(adds: 'tuple[PreCommitAdd, ...]') -> str | None:
+    """Replay preceding git adds and report the first failure.
 
     Args:
         adds: Parsed git add commands preceding the commit.
 
     Returns:
-        `True` when every add succeeds; otherwise `False`.
+        `None` when every add succeeds; otherwise the first Git failure detail.
     """
     for add in adds:
-        try:
-            executable = git_executable()
-            if executable is None:
-                return False
-            result = subprocess.run(  # noqa: S603
-                [executable, *add.tokens[1:]],
-                cwd=add.exec_cwd,
-                capture_output=True,
-                check=False,
-            )
-        except OSError:
-            return False
-        if result.returncode != 0:
-            return False
-    return True
+        result = run_git_command_bytes(list(add.tokens), add.exec_cwd, catch_value_error=False)
+        if result is None or result.returncode != 0:
+            return git_failure_detail(result)
+    return None

@@ -3,38 +3,44 @@ import json
 import os
 import shlex
 import subprocess
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import docwrap._hook as hook_mod
-from docwrap._classify import _REASON_PREFIX
+import docwrap._hook_front as front_mod
 from docwrap._core._incremental import DiffHunk
 from docwrap._exceptions import UnknownStyleError
 from docwrap._files import ReadResult, read_file_result, write_preserving_newline
 from docwrap._git import IndexEntry, RepoDiscoveryResult, RepoDiscoveryStatus, StagedFileInfo
-from docwrap._grammar import _ELEMENT_UNKNOWN_CWD, _HINT_COMMIT, _HINT_ROUTE, CommitMode
 from docwrap._hook import (
-    _fail,
-    _Outcome,
     _PreToolContext,
     _print_skips,
     _resolve_edited_paths,
     _wrap_staged_blobs,
     _wrap_worktree_files,
     _WrapResult,
-    _WrapWorktreeResult,
-    run_hook,
 )
+from docwrap._hook_front import _REASON_PREFIX, Outcome, fail, run_hook
 from docwrap._hosts import load_adapter
 from docwrap._types import (
     BaselineResult,
     BaselineStatus,
     DocstringSkip,
-    PreCommitAdd,
     WorktreeWrapContext,
+    WorktreeWrite,
 )
+from docwrap._vendor.hookshell._grammar import (
+    _ELEMENT_UNKNOWN_CWD,
+    _HINT_COMMIT,
+    _HINT_ROUTE,
+    CommitMode,
+    PreCommitAdd,
+)
+from docwrap.hooks import HookAdapter, HookResult, HostInput, HostResponse
 from tests.helpers import (
     BUILTIN_ENTRY_POINTS,
     decode_text,
@@ -43,6 +49,7 @@ from tests.helpers import (
     run_setup,
     shell_path,
 )
+from tests.hosts_example.adapter import ExampleAdapter
 
 BACKSLASH = chr(92)
 _CONTROL_TEXT = 'esc\x1bcr\rtab\tdel\x7fc1\x85'
@@ -80,6 +87,66 @@ _POST_TOOL_WRAPPED_SOURCE = (
 _RECEIPT_ONE = {'systemMessage': 'docwrap: wrapped 1 staged Python file for this commit'}
 _UNKNOWN_CWD_REASON = f'{_REASON_PREFIX}: {_ELEMENT_UNKNOWN_CWD}; {_HINT_ROUTE}'
 _VISIBLE_CONTROL_TEXT = r'esc\x1bcr\x0dtab\x09del\x7fc1\x85'
+
+
+class TestEngineImportFailure:
+    def test_commit_denies_when_engine_import_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'docwrap._hook', None)
+        outcome = front_mod._run_pre_tool_use(
+            'git commit -m message', str(tmp_path), allow_on_failure=False, incremental=None
+        )
+        assert (outcome.decision, outcome.reason) == (
+            'deny',
+            'docwrap: unexpected error during wrapping',
+        )
+
+    def test_commit_engine_call_import_error_is_not_handled_as_import_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def raise_import_error(*_args: object, **_kwargs: object) -> None:
+            raise ImportError('engine call failed')
+
+        monkeypatch.setattr(hook_mod, 'run_commit', raise_import_error)
+        with pytest.raises(ImportError, match='engine call failed'):
+            front_mod._run_pre_tool_use(
+                'git commit -m message', str(tmp_path), allow_on_failure=False, incremental=None
+            )
+
+    def test_commit_warns_and_allows_with_allow_on_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'docwrap._hook', None)
+        outcome = front_mod._run_pre_tool_use(
+            'git commit -m message', str(tmp_path), allow_on_failure=True, incremental=None
+        )
+        assert outcome.decision == 'allow'
+        assert 'WARNING: docwrap: unexpected error during wrapping' in capsys.readouterr().err
+
+    def test_post_tool_allows_with_diagnostic_when_engine_import_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'docwrap._hook', None)
+        outcome = front_mod._run_post_tool((), str(tmp_path), incremental=None)
+        assert outcome.decision == 'allow'
+        assert 'docwrap: unexpected error during PostToolUse' in capsys.readouterr().err
+
+    def test_post_tool_engine_call_import_error_is_not_handled_as_import_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def raise_import_error(*_args: object, **_kwargs: object) -> None:
+            raise ImportError('engine call failed')
+
+        monkeypatch.setattr(hook_mod, 'run_post_tool', raise_import_error)
+        with pytest.raises(ImportError, match='engine call failed'):
+            front_mod._run_post_tool((), str(tmp_path), incremental=None)
 
 
 class TestPreToolUseDispatchers:
@@ -243,32 +310,34 @@ class TestProcessFileReadEfficiency:
 
         monkeypatch.setattr(hook_mod, 'read_file_result', tracked_reader)
 
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         assert calls == [path]
 
 
 class TestProtocolHelpers:
-    def test_fail_controls_are_visible_only_in_human_warning(
+    def test_fail_controls_are_visible_in_warning_and_deny(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         reason = f'git failure {_CONTROL_TEXT}'
 
-        assert _fail(reason, allow_on_failure=True) == _Outcome('allow')
+        assert fail(reason, allow_on_failure=True) == Outcome('allow')
         captured = capsys.readouterr()
         assert captured.err == f'WARNING: git failure {_VISIBLE_CONTROL_TEXT}\n'
         assert captured.out == ''
 
-        assert _fail(reason, allow_on_failure=False) == _Outcome('deny', reason)
+        assert fail(reason, allow_on_failure=False) == Outcome(
+            'deny', f'git failure {_VISIBLE_CONTROL_TEXT}'
+        )
         assert capsys.readouterr() == ('', '')
 
     def test_fail_deny(self, capsys: pytest.CaptureFixture[str]) -> None:
-        assert _fail('git error', allow_on_failure=False) == _Outcome('deny', 'git error')
+        assert fail('git error', allow_on_failure=False) == Outcome('deny', 'git error')
         assert capsys.readouterr() == ('', '')
 
     def test_fail_warns_and_allows(self, capsys: pytest.CaptureFixture[str]) -> None:
-        result = _fail('git error', allow_on_failure=True)
-        assert result == _Outcome('allow')
+        result = fail('git error', allow_on_failure=True)
+        assert result == Outcome('allow')
         captured = capsys.readouterr()
         assert 'WARNING' in captured.err
         assert 'git error' in captured.err
@@ -345,7 +414,7 @@ class TestWrapWorktreeFiles:
             source: str,
             encoding: str,
             *,
-            raw: bytes | None = None,
+            raw: bytes,
         ) -> None:
             writer_raw.append(raw)
             real_writer(candidate, source, encoding, raw=raw)
@@ -635,6 +704,39 @@ class TestWrapWorktreeFiles:
 
 
 class TestWrapWorktreeFilesReadError:
+    @pytest.mark.parametrize('allow_on_failure', [False, True])
+    def test_bad_encoding_cookie_preserves_failure_policy(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        allow_on_failure: bool,
+    ) -> None:
+        bad = tmp_path / 'bad.py'
+        bad.write_bytes(b'# coding: unknown-encoding\npass\n')
+        good = tmp_path / 'good.py'
+        _write_long_arg_docstring(good)
+        original = good.read_bytes()
+
+        result = _wrap_worktree_files(
+            WorktreeWrapContext(
+                repo_root=tmp_path,
+                incr_level=None,
+                allow_on_failure=allow_on_failure,
+            ),
+            ['bad.py', 'good.py'],
+        )
+
+        assert bad.read_bytes() == b'# coding: unknown-encoding\npass\n'
+        if allow_on_failure:
+            assert result.failure is None
+            assert good.read_bytes() != original
+            assert 'WARNING: docwrap: cannot read bad.py' in capsys.readouterr().err
+        else:
+            assert result.failure is not None
+            assert result.failure.decision == 'deny'
+            assert good.read_bytes() == original
+
     def test_read_error_allow_warns_and_continues(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -702,9 +804,7 @@ class TestWrapWorktreeRollback:
 
         original_b = b.read_bytes()
 
-        def fail_second_write(
-            path: Path, source: str, encoding: str, *, raw: bytes | None = None
-        ) -> None:
+        def fail_second_write(path: Path, source: str, encoding: str, *, raw: bytes) -> None:
             if path == b:
                 raise OSError('simulated write failure')
             write_preserving_newline(path, source, encoding, raw=raw)
@@ -721,7 +821,85 @@ class TestWrapWorktreeRollback:
         assert result.failure is None
         assert a.read_text() == _POST_TOOL_WRAPPED_SOURCE
         assert b.read_bytes() == original_b
-        assert capsys.readouterr().err == f'WARNING: docwrap: failed to write {b}\n'
+        assert capsys.readouterr().err == f'WARNING: docwrap: failed to write {b.as_posix()}\n'
+
+    def test_failed_restore_is_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        a = tmp_path / 'a.py'
+        b = tmp_path / 'b.py'
+        original = _post_tool_long_source().encode()
+        a.write_bytes(original)
+        b.write_bytes(original)
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def failed_writes(path: Path, data: bytes) -> int:
+            nonlocal calls
+            if path == b:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(path, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+                raise OSError('restore failed')
+            return original_write_bytes(path, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', failed_writes)
+        result = _wrap_worktree_files(
+            WorktreeWrapContext(repo_root=tmp_path, incr_level=None, allow_on_failure=True),
+            ['a.py', 'b.py'],
+        )
+
+        assert result.failure is None
+        assert calls == 2
+        assert 'restoring the original bytes also failed' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('allow_on_failure', [False, True])
+    def test_failing_file_is_restored(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        allow_on_failure: bool,
+    ) -> None:
+        a = tmp_path / 'a.py'
+        b = tmp_path / 'b.py'
+        original = _post_tool_long_source().encode()
+        a.write_bytes(original)
+        b.write_bytes(original)
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def partial_write(path: Path, data: bytes) -> int:
+            nonlocal calls
+            if path == b:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(path, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+            return original_write_bytes(path, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', partial_write)
+        result = _wrap_worktree_files(
+            WorktreeWrapContext(
+                repo_root=tmp_path, incr_level=None, allow_on_failure=allow_on_failure
+            ),
+            ['a.py', 'b.py'],
+        )
+
+        assert calls == 2
+        assert b.read_bytes() == original
+        if allow_on_failure:
+            assert result.failure is None
+            assert a.read_text() == _POST_TOOL_WRAPPED_SOURCE
+            assert capsys.readouterr().err == f'WARNING: docwrap: failed to write {b.as_posix()}\n'
+        else:
+            assert result.failure is not None
+            assert result.failure.decision == 'deny'
+            assert a.read_bytes() == original
 
     def test_rollback_on_write_failure(self, tmp_path: Path) -> None:
         a = tmp_path / 'a.py'
@@ -785,6 +963,56 @@ class TestWrapWorktreeRollback:
         assert result.failure.decision == 'deny'
 
 
+class _AdapterFields:
+    def __init__(self, fields: dict[str, object]) -> None:
+        self._fields = fields
+
+    def __getattr__(self, name: str) -> object:
+        if name not in self._fields:
+            raise AttributeError(name)
+        value = self._fields[name]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class _AdapterProbe:
+    requires_event = False
+
+    def __init__(self, parsed: object, response: object) -> None:
+        self._parsed = parsed
+        self._response = response
+
+    def parse(self, payload: Mapping[str, object], event: str | None) -> object:
+        del payload, event
+        if isinstance(self._parsed, BaseException):
+            raise self._parsed
+        return self._parsed
+
+    def render(self, result: HookResult) -> object:
+        del result
+        if isinstance(self._response, BaseException):
+            raise self._response
+        return self._response
+
+    def render_failure(self, reason: str) -> object:
+        del reason
+        return self._response
+
+
+def _antigravity_payload(tool_name: str, args: dict[str, object], workspace: Path) -> str:
+    return json.dumps(
+        {
+            'toolCall': {'name': tool_name, 'args': args},
+            'workspacePaths': [str(workspace)],
+        }
+    )
+
+
+def _antigravity_pretooluse_payload(cmd: str, cwd: Path) -> str:
+    return _antigravity_payload('run_command', {'CommandLine': cmd, 'Cwd': str(cwd)}, cwd)
+
+
 def _assert_uniform_newlines(raw: bytes, *, crlf: bool) -> None:
     if crlf:
         assert b'\r\n' in raw
@@ -829,6 +1057,13 @@ def _init_hook_repo(repo: Path, *, hook_enabled: bool) -> None:
     )
     (repo / 'baseline.py').write_text('# baseline\n')
     git_commit_all(repo, 'initial')
+
+
+def _install_adapter_probe(monkeypatch: pytest.MonkeyPatch, adapter: object) -> None:
+    def load_probe(_host: str) -> HookAdapter:
+        return cast('HookAdapter', adapter)
+
+    monkeypatch.setattr(front_mod, 'load_adapter', load_probe)
 
 
 def _isolate_global_git(
@@ -895,7 +1130,7 @@ class TestAntigravityProtocol:
         run_setup(['git', 'add', '.'], cwd=str(target_repo))
         monkeypatch.chdir(process_repo)
 
-        result = _run_agy(antigravity_pretooluse_payload('git commit -m "test"', target_repo))
+        result = _run_agy(_antigravity_pretooluse_payload('git commit -m "test"', target_repo))
 
         assert result == 0
         assert json.loads(capsys.readouterr().out) == _RECEIPT_ONE
@@ -926,7 +1161,7 @@ class TestAntigravityProtocol:
         )
         run_setup(['git', 'add', '.'], cwd=str(tmp_path))
 
-        result = _run_agy(antigravity_pretooluse_payload('git commit -m "test"', tmp_path))
+        result = _run_agy(_antigravity_pretooluse_payload('git commit -m "test"', tmp_path))
 
         assert result == 0
         assert json.loads(capsys.readouterr().out) == _RECEIPT_ONE
@@ -946,7 +1181,7 @@ class TestAntigravityProtocol:
         run_setup(['git', 'config', 'docwrap.hook', 'true'], cwd=str(tmp_path))
         monkeypatch.setattr('docwrap._hook.get_staged_py_info', _git_file_list_failure)
 
-        result = _run_agy(antigravity_pretooluse_payload('git commit -m "test"', tmp_path))
+        result = _run_agy(_antigravity_pretooluse_payload('git commit -m "test"', tmp_path))
 
         assert result == 0
         output = json.loads(capsys.readouterr().out)
@@ -958,9 +1193,9 @@ class TestAntigravityProtocol:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _antigravity_hook_enabled)
+        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _hook_enabled)
 
-        result = _run_agy(antigravity_pretooluse_payload('pytest -q', tmp_path))
+        result = _run_agy(_antigravity_pretooluse_payload('pytest -q', tmp_path))
 
         assert result == 0
         assert capsys.readouterr().out == ''
@@ -976,16 +1211,16 @@ class TestAntigravityProtocol:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _antigravity_hook_enabled)
+        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _hook_enabled)
         text_file = tmp_path / 'notes.txt'
         text_file.write_text('unchanged')
 
         non_python = _run_agy(
-            antigravity_payload('write_to_file', {'TargetFile': str(text_file)}, tmp_path),
+            _antigravity_payload('write_to_file', {'TargetFile': str(text_file)}, tmp_path),
             event='PostToolUse',
         )
         unsupported = _run_agy(
-            antigravity_payload('read_file', {'TargetFile': str(text_file)}, tmp_path),
+            _antigravity_payload('read_file', {'TargetFile': str(text_file)}, tmp_path),
             event='PostToolUse',
         )
 
@@ -1000,14 +1235,14 @@ class TestAntigravityProtocol:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _antigravity_hook_enabled)
+        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _hook_enabled)
         monkeypatch.chdir('/')
         f = tmp_path / 'foo.py'
         original = _post_tool_long_source()
         f.write_text(original)
 
         result = _run_agy(
-            antigravity_payload('replace_file_content', {'TargetFile': 'foo.py'}, tmp_path),
+            _antigravity_payload('replace_file_content', {'TargetFile': 'foo.py'}, tmp_path),
             event='PostToolUse',
         )
 
@@ -1027,7 +1262,7 @@ class TestAntigravityProtocol:
         f = tmp_path / 'foo.py'
         _write_long_arg_docstring(f)
         run_setup(['git', 'add', '.'], cwd=str(tmp_path))
-        payload = antigravity_payload(
+        payload = _antigravity_payload(
             'run_command', {'CommandLine': 'git commit -m "test"'}, tmp_path
         )
 
@@ -1044,13 +1279,13 @@ class TestAntigravityProtocol:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _antigravity_hook_enabled)
+        monkeypatch.setattr('docwrap._hook.is_hook_enabled', _hook_enabled)
         f = tmp_path / 'foo.py'
         original = _post_tool_long_source()
         f.write_text(original)
 
         result = _run_agy(
-            antigravity_payload('write_to_file', {'TargetFile': str(f)}, tmp_path),
+            _antigravity_payload('write_to_file', {'TargetFile': str(f)}, tmp_path),
             event='PostToolUse',
         )
 
@@ -1071,6 +1306,36 @@ class TestLastResort:
             "docwrap: host 'broken-parse' failed to parse the payload: parse exploded\n"
         )
 
+    @pytest.mark.parametrize('exception_type', [KeyboardInterrupt, SystemExit])
+    @pytest.mark.parametrize('boundary', ['metadata', 'parse', 'input', 'render', 'response'])
+    def test_adapter_process_control_exceptions_propagate(
+        self,
+        boundary: str,
+        exception_type: type[BaseException],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        failure = exception_type('stop')
+        parsed: object = HostInput('pre_tool', None, '.', None)
+        response: object = HostResponse('', '', 0)
+        if boundary == 'parse':
+            parsed = failure
+        elif boundary == 'input':
+            parsed = _AdapterFields({'command_cwd': failure})
+        elif boundary == 'render':
+            response = failure
+        elif boundary == 'response':
+            response = _AdapterFields({'stdout': 'partial', 'stderr': failure, 'exit_code': 0})
+        adapter = _AdapterProbe(parsed, response)
+        _install_adapter_probe(
+            monkeypatch,
+            _AdapterFields({'requires_event': failure}) if boundary == 'metadata' else adapter,
+        )
+
+        with pytest.raises(exception_type, match='stop'):
+            run_hook('{}', host='probe')
+        assert capsys.readouterr() == ('', '')
+
     def test_both_render_paths_failing_is_the_last_resort(
         self, capsys: pytest.CaptureFixture[str], example_hosts: Path
     ) -> None:
@@ -1082,22 +1347,25 @@ class TestLastResort:
             captured.err == "docwrap: host 'broken-both' failed to render the failure response\n"
         )
 
-    @pytest.mark.usefixtures('example_hosts')
-    @pytest.mark.parametrize('host', ['empty-cwd', 'relative-cwd', 'typed-cwd'])
-    def test_invalid_command_cwd_is_a_last_resort_failure(
+    @pytest.mark.parametrize('exception_type', [KeyboardInterrupt, SystemExit])
+    def test_failure_renderer_process_control_exceptions_propagate(
         self,
-        host: str,
-        capsys: pytest.CaptureFixture[str],
+        exception_type: type[BaseException],
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        def explode(*_args: object, **_kwargs: object) -> None:
-            raise AssertionError('repository code must not run')
+        class InterruptedFailureAdapter(_AdapterProbe):
+            def render_failure(self, reason: str) -> object:
+                del reason
+                raise exception_type('stop')
 
-        monkeypatch.setattr('docwrap._hook._run_event', explode)
-        assert run_hook(_LAST_RESORT_PAYLOAD, host=host) == 2
-        captured = capsys.readouterr()
-        assert captured.out == ''
-        assert 'invalid command_cwd' in captured.err
+        adapter = InterruptedFailureAdapter(
+            HostInput('pre_tool', None, '.', None), RuntimeError('render failed')
+        )
+        _install_adapter_probe(monkeypatch, adapter)
+        with pytest.raises(exception_type, match='stop'):
+            run_hook('{}', host='probe')
+        assert capsys.readouterr() == ('', '')
 
     def test_invalid_json_and_inapplicable_payloads_are_silent(
         self, capsys: pytest.CaptureFixture[str], example_hosts: Path
@@ -1107,6 +1375,162 @@ class TestLastResort:
         assert run_hook('[1]', host='example') == 0
         assert run_hook(json.dumps({'hook_event_name': 'Notification'}), host='example') == 0
         assert capsys.readouterr() == ('', '')
+
+    @pytest.mark.parametrize('raises', [False, True])
+    @pytest.mark.parametrize(
+        'field', ['requires_event', 'command_cwd', 'event', 'command', 'cwd', 'edited_paths']
+    )
+    def test_malformed_adapter_fields_fail_closed(
+        self,
+        field: str,
+        raises: bool,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fields: dict[str, object] = {
+            'event': 'post_tool' if field in {'cwd', 'edited_paths'} else 'pre_tool',
+            'command': 'ls',
+            'command_cwd': None,
+            'cwd': '.',
+            'edited_paths': (),
+        }
+        if field != 'requires_event':
+            fields.pop(field)
+            if raises:
+                fields[field] = RuntimeError('first\nsecond')
+        adapter = _AdapterProbe(_AdapterFields(fields), HostResponse('', '', 0))
+        if field == 'requires_event':
+            metadata: dict[str, object] = {'parse': adapter.parse}
+            if raises:
+                metadata[field] = RuntimeError('first\nsecond')
+            _install_adapter_probe(monkeypatch, _AdapterFields(metadata))
+        else:
+            _install_adapter_probe(monkeypatch, adapter)
+
+        assert run_hook('{}', host='probe\nname') == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert len(captured.err.splitlines()) == 1
+        assert captured.err.startswith("docwrap: host 'probe\\x0aname'")
+        assert 'Traceback' not in captured.err
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [('event', 'PostToolUse'), ('event', 42), ('command', 42)],
+    )
+    def test_invalid_adapter_values_fail_closed(
+        self,
+        field: str,
+        value: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fields: dict[str, object] = {
+            'event': 'pre_tool',
+            'command': 'ls',
+            'command_cwd': None,
+            'cwd': '.',
+            'edited_paths': (),
+        }
+        fields[field] = value
+        _install_adapter_probe(
+            monkeypatch, _AdapterProbe(_AdapterFields(fields), HostResponse('', '', 0))
+        )
+
+        assert run_hook('{}', host='probe') == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err.startswith("docwrap: host 'probe' failed to parse the payload:")
+
+    @pytest.mark.parametrize(
+        'case',
+        [
+            ('cwd', 42, 'post-tool cwd must be a string'),
+            ('edited_paths', (42,), 'post-tool edited paths must be strings'),
+        ],
+    )
+    def test_malformed_post_tool_paths_fail_before_repository_work(
+        self,
+        case: tuple[str, object, str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        field, value, detail = case
+        source = tmp_path / 'mod.py'
+        source.write_bytes(b'def zulu():\n    pass\n')
+        fields: dict[str, object] = {
+            'event': 'post_tool',
+            'command': None,
+            'command_cwd': None,
+            'cwd': str(tmp_path),
+            'edited_paths': ('mod.py',),
+        }
+        fields[field] = value
+        adapter = _AdapterProbe(_AdapterFields(fields), HostResponse('partial', '', 0))
+        _install_adapter_probe(monkeypatch, adapter)
+
+        def fail_if_called(*_args: object, **_kwargs: object) -> None:
+            pytest.fail('repository or source work was called')
+
+        for name in ('discover_repo_root', 'read_file_result', 'write_preserving_newline'):
+            monkeypatch.setattr(hook_mod, name, fail_if_called)
+
+        assert run_hook('{}', host='probe\nname') == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert len(captured.err.splitlines()) == 1
+        assert captured.err.startswith("docwrap: host 'probe\\x0aname'")
+        assert detail in captured.err
+        assert 'Traceback' not in captured.err
+        assert source.read_bytes() == b'def zulu():\n    pass\n'
+
+    @pytest.mark.parametrize('field', ['stdout', 'stderr', 'exit_code'])
+    @pytest.mark.parametrize('failure', ['missing', 'raising', 'wrong_type'])
+    def test_malformed_response_emits_no_partial_output(
+        self,
+        field: str,
+        failure: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fields: dict[str, object] = {
+            'stdout': '{"decision":"allow"}\n',
+            'stderr': 'note\n',
+            'exit_code': 0,
+        }
+        fields.pop(field)
+        if failure == 'raising':
+            fields[field] = RuntimeError('first\nsecond')
+        elif failure == 'wrong_type':
+            fields[field] = 'zero' if field == 'exit_code' else 7
+        adapter = _AdapterProbe(HostInput('pre_tool', None, '.', None), _AdapterFields(fields))
+        _install_adapter_probe(monkeypatch, adapter)
+
+        assert run_hook('{}', host='probe\nname') == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert len(captured.err.splitlines()) == 1
+        assert captured.err.startswith("docwrap: host 'probe\\x0aname'")
+        assert 'Traceback' not in captured.err
+
+    def test_malformed_response_recovers_with_valid_denial(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class RecoveringAdapter(_AdapterProbe):
+            def render_failure(self, reason: str) -> HostResponse:
+                return HostResponse('denied', reason, 2)
+
+        adapter = RecoveringAdapter(
+            HostInput('pre_tool', None, '.', None),
+            _AdapterFields({'stdout': 'partial allow', 'stderr': ''}),
+        )
+        _install_adapter_probe(monkeypatch, adapter)
+        assert run_hook('{}', host='probe') == 2
+        assert capsys.readouterr() == (
+            'denied',
+            "docwrap: host 'probe' failed to render the response",
+        )
 
     def test_missing_and_unexpected_event(
         self, capsys: pytest.CaptureFixture[str], example_hosts: Path
@@ -1134,6 +1558,57 @@ class TestLastResort:
             }
         }
         assert captured.err == "docwrap: host 'broken-render' failed to render the response\n"
+
+    @pytest.mark.parametrize('failure', ['missing', 'raising'])
+    def test_unusable_renderers_fail_closed(
+        self,
+        failure: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        adapter = _AdapterProbe(HostInput('pre_tool', None, '.', None), HostResponse('', '', 0))
+        fields: dict[str, object] = {'requires_event': False, 'parse': adapter.parse}
+        if failure == 'raising':
+            fields.update(
+                render=RuntimeError('render failed'), render_failure=RuntimeError('failure failed')
+            )
+        _install_adapter_probe(monkeypatch, _AdapterFields(fields))
+        assert run_hook('{}', host='probe') == 2
+        assert capsys.readouterr() == (
+            '',
+            "docwrap: host 'probe' failed to render the failure response\n",
+        )
+
+    @pytest.mark.usefixtures('example_hosts')
+    def test_raising_adapter_version_is_contained(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def fail_version(_self: object) -> int:
+            raise RuntimeError('first\nsecond')
+
+        monkeypatch.setattr(ExampleAdapter, 'api_version', property(fail_version))
+        assert run_hook(_LAST_RESORT_PAYLOAD, host='example') == 2
+        assert capsys.readouterr() == (
+            '',
+            "docwrap: host 'example' failed to load: first\\x0asecond\n",
+        )
+
+    @pytest.mark.usefixtures('example_hosts')
+    @pytest.mark.parametrize('host', ['empty-cwd', 'relative-cwd', 'typed-cwd'])
+    def test_invalid_command_cwd_is_a_last_resort_failure(
+        self,
+        host: str,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def explode(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError('repository code must not run')
+
+        monkeypatch.setattr('docwrap._hook_front._run_event', explode)
+        assert run_hook(_LAST_RESORT_PAYLOAD, host=host) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert 'invalid command_cwd' in captured.err
 
     @pytest.mark.usefixtures('registered_hosts')
     def test_unknown_host(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1172,16 +1647,7 @@ class TestPathspecFailOpenOnModifiedNone:
             'docwrap._hook.get_modified_tracked_py_files',
             _git_file_list_failure,
         )
-        wrap_called: list[list[str]] = []
-
-        def tracking_wrap(
-            _ctx: WorktreeWrapContext,
-            paths: list[str],
-        ) -> _WrapWorktreeResult:
-            wrap_called.append(paths)
-            return _WrapWorktreeResult()
-
-        monkeypatch.setattr('docwrap._hook._wrap_worktree_files', tracking_wrap)
+        original = f.read_bytes()
 
         event = {
             'hook_event_name': 'PreToolUse',
@@ -1191,8 +1657,7 @@ class TestPathspecFailOpenOnModifiedNone:
         }
         _run_claude(json.dumps(event), allow_on_failure=True)
 
-        # Should NOT have called _wrap_worktree_files (failed before reaching it)
-        assert not wrap_called
+        assert f.read_bytes() == original
         captured = capsys.readouterr()
         assert 'WARNING' in captured.err
 
@@ -1225,17 +1690,7 @@ class TestPathspecFailOpenOnModifiedNone:
             'docwrap._hook.get_modified_tracked_py_files',
             _git_file_list_failure,
         )
-
-        wrap_called: list[list[str]] = []
-
-        def tracking_wrap(
-            _ctx: WorktreeWrapContext,
-            paths: list[str],
-        ) -> _WrapWorktreeResult:
-            wrap_called.append(paths)
-            return _WrapWorktreeResult()
-
-        monkeypatch.setattr('docwrap._hook._wrap_worktree_files', tracking_wrap)
+        original = f.read_bytes()
 
         event = {
             'hook_event_name': 'PreToolUse',
@@ -1246,8 +1701,7 @@ class TestPathspecFailOpenOnModifiedNone:
         _run_claude(json.dumps(event))
         output = capsys.readouterr().out
 
-        # Should deny (not call _wrap_worktree_files at all)
-        assert not wrap_called
+        assert f.read_bytes() == original
         assert output.strip()
         data = json.loads(output)
         assert data['hookSpecificOutput']['permissionDecision'] == 'deny'
@@ -1373,8 +1827,14 @@ class TestPostToolUseSkipReporting:
         text = f.read_text()
         assert 'Line one ' + BACKSLASH + '\n' in text  # skipped docstring untouched
         assert 'definitely\n' in text  # other docstring wrapped
-        err = capsys.readouterr().err
-        assert f'docwrap: {f}:2: skipme skipped (line-continuation):' in err
+        captured = capsys.readouterr()
+        assert f'docwrap: {f.as_posix()}:2: skipme skipped (line-continuation):' in captured.err
+        assert json.loads(captured.out) == {
+            'hookSpecificOutput': {
+                'hookEventName': 'PostToolUse',
+                'additionalContext': captured.err.rstrip('\n'),
+            }
+        }
 
 
 @pytest.mark.usefixtures('registered_hosts')
@@ -1838,16 +2298,7 @@ class TestPreToolUseModificationFiltering:
         # foo.py is tracked but NOT modified since last commit
 
         monkeypatch.setattr('docwrap._hook.is_hook_enabled', _hook_enabled)
-        captured_paths: list[list[str]] = []
-
-        def tracking_wrap(
-            ctx: WorktreeWrapContext,
-            paths: list[str],
-        ) -> _WrapWorktreeResult:
-            captured_paths.append(list(paths))
-            return _wrap_worktree_files(ctx, paths)
-
-        monkeypatch.setattr('docwrap._hook._wrap_worktree_files', tracking_wrap)
+        original = f.read_bytes()
 
         event = {
             'hook_event_name': 'PreToolUse',
@@ -1857,10 +2308,7 @@ class TestPreToolUseModificationFiltering:
         }
         _run_claude(json.dumps(event))
 
-        # _wrap_worktree_files should either not be called, or called
-        # with foo.py excluded from the paths argument.
-        for paths in captured_paths:
-            assert 'foo.py' not in paths
+        assert f.read_bytes() == original
 
 
 @pytest.mark.usefixtures('registered_hosts')
@@ -2399,7 +2847,7 @@ class TestAntigravityPreToolUseTargetHookConfig:
         run_setup(['git', 'add', 'foo.py'], cwd=target)
         before = _staged_text(target, 'foo.py')
 
-        payload = antigravity_pretooluse_payload(
+        payload = _antigravity_pretooluse_payload(
             command_template.format(target=shell_path(target)),
             workspace,
         )
@@ -2941,7 +3389,7 @@ class TestPostToolUseEncoding:
         path.write_bytes(raw)
 
         counts, read_bytes = _track_post_tool_io(path, monkeypatch)
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         first = read_bytes(path)
         assert counts == {'reads': 1, 'writes': 1}
@@ -2951,7 +3399,7 @@ class TestPostToolUseEncoding:
         _assert_uniform_newlines(first, crlf=newline == '\r\n')
 
         counts.update(reads=0, writes=0)
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         assert counts == {'reads': 1, 'writes': 0}
         assert read_bytes(path) == first
@@ -2988,10 +3436,62 @@ class TestPostToolUseExceptionHandling:
             return discover(cwd)
 
         monkeypatch.setattr(hook_mod, 'discover_repo_root', track_discovery)
-        hook_mod._run_post_tool_use(list(map(str, paths)), str(git_repo), incremental=False)
+        hook_mod.run_post_tool(list(map(str, paths)), str(git_repo), incremental=False)
 
         assert discovered == [str(git_repo), str(nested)]
         assert all(path.read_text() != _post_tool_long_source() for path in paths)
+
+    def test_oserror_prints_stderr_returns_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text('pass\n')
+
+        def raise_oserror(
+            _path: Path,
+            _incremental_override: bool | None,
+            *,
+            repo_root: str | None = None,
+        ) -> None:
+            assert repo_root is not None
+            raise OSError('disk failure')
+
+        monkeypatch.setattr('docwrap._hook._prepare_post_tool_file', raise_oserror)
+        event = hook_event('PostToolUse', 'Edit', {'file_path': str(f)})
+        result = _run_claude(json.dumps(event))
+        assert result == 0
+        assert 'PostToolUse error processing' in capsys.readouterr().err
+
+    def test_post_tool_failed_restore_is_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / 'test.py'
+        path.write_text(_post_tool_long_source())
+        original_write_bytes = Path.write_bytes
+        calls = 0
+
+        def failed_writes(candidate: Path, data: bytes) -> int:
+            nonlocal calls
+            if candidate == path:
+                calls += 1
+                if calls == 1:
+                    original_write_bytes(candidate, data[: len(data) // 2])
+                    raise OSError(errno.ENOSPC, 'No space left on device')
+                raise OSError('restore failed')
+            return original_write_bytes(candidate, data)
+
+        monkeypatch.setattr(Path, 'write_bytes', failed_writes)
+        event = hook_event('PostToolUse', 'Edit', {'file_path': str(path)})
+        assert _run_claude(json.dumps(event)) == 0
+
+        captured = capsys.readouterr()
+        assert calls == 2
+        assert 'restoring the original bytes also failed' in captured.err
+        context = json.loads(captured.out)['hookSpecificOutput']['additionalContext']
+        assert 'restoring the original bytes also failed' in context
 
     @pytest.mark.parametrize('file_count', [1, 2])
     def test_preparation_failure_has_common_diagnostic_and_preserves_later_files(
@@ -3015,9 +3515,12 @@ class TestPostToolUseExceptionHandling:
             return prepare(path, incremental_override, repo_root=repo_root)
 
         monkeypatch.setattr(hook_mod, '_prepare_post_tool_file', prepare_or_fail)
-        hook_mod._run_post_tool_use(list(map(str, paths)), str(tmp_path), incremental=False)
+        hook_mod.run_post_tool(list(map(str, paths)), str(tmp_path), incremental=False)
 
-        assert capsys.readouterr().err == f'docwrap: PostToolUse error processing {paths[0]}\n'
+        assert (
+            capsys.readouterr().err
+            == f'docwrap: PostToolUse error processing {paths[0].as_posix()}\n'
+        )
         assert paths[0].read_text() == source
         for path in paths[1:]:
             assert path.read_text() != source
@@ -3042,56 +3545,23 @@ class TestPostToolUseExceptionHandling:
             return RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(nested))
 
         monkeypatch.setattr(hook_mod, 'discover_repo_root', discover)
-        hook_mod._run_post_tool_use(list(map(str, paths)), str(tmp_path), incremental=False)
+        hook_mod.run_post_tool(list(map(str, paths)), str(tmp_path), incremental=False)
 
         assert calls == [str(tmp_path), str(nested)]
         assert all(path.read_text() != _post_tool_long_source() for path in paths)
-
-    def test_oserror_prints_stderr_returns_0(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-
-        def raise_oserror(
-            _path: Path,
-            _incremental_override: bool | None,
-            *,
-            repo_root: str | None = None,
-        ) -> None:
-            assert repo_root is not None
-            raise OSError('disk failure')
-
-        monkeypatch.setattr('docwrap._hook._prepare_post_tool_file', raise_oserror)
-        event = hook_event('PostToolUse', 'Edit', {'file_path': str(f)})
-        result = _run_claude(json.dumps(event))
-        assert result == 0
-        assert 'PostToolUse error processing' in capsys.readouterr().err
 
     @pytest.mark.parametrize('tool_name', [None, [], {}, 1, True], ids=repr)
     @pytest.mark.parametrize('provider', ['claude', 'codex', 'antigravity'])
     def test_non_string_tool_name_is_an_unsupported_event(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         provider: str,
         tool_name: object,
     ) -> None:
         path = tmp_path / 'test.py'
-        path.write_text('pass\n')
-        processed: list[Path] = []
-
-        def track_process(
-            processed_path: Path,
-            _incremental_override: bool | None,
-            *,
-            repo_root: str | None = None,
-        ) -> None:
-            assert repo_root is not None
-            processed.append(processed_path)
-
-        monkeypatch.setattr('docwrap._hook._prepare_post_tool_file', track_process)
+        original = _post_tool_long_source().encode()
+        path.write_bytes(original)
 
         if provider == 'codex':
             direct_payload: dict[str, object] = {
@@ -3126,7 +3596,7 @@ class TestPostToolUseExceptionHandling:
         captured = capsys.readouterr()
         assert captured.out == ''
         assert captured.err == ''
-        assert processed == []
+        assert path.read_bytes() == original
 
     @pytest.mark.parametrize(
         ('tool_name', 'tool_input'),
@@ -3157,21 +3627,10 @@ class TestPostToolUseExceptionHandling:
         ]
 
     def test_syntax_error_prints_stderr_returns_0(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-
-        def raise_syntax(
-            _path: Path,
-            _incremental_override: bool | None,
-            *,
-            repo_root: str | None = None,
-        ) -> None:
-            assert repo_root is not None
-            raise SyntaxError('bad syntax')
-
-        monkeypatch.setattr('docwrap._hook._prepare_post_tool_file', raise_syntax)
+        f.write_bytes(b'# -*- coding: bogus -*-\npass\n')
         event = hook_event('PostToolUse', 'Edit', {'file_path': str(f)})
         result = _run_claude(json.dumps(event))
         assert result == 0
@@ -3199,27 +3658,6 @@ class TestPostToolUseExceptionHandling:
         err = capsys.readouterr().err
         assert 'RuntimeError' in err
         assert 'unexpected bug' in err
-
-    def test_unknown_style_prints_stderr_returns_0(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text('pass\n')
-
-        def raise_unknown_style(
-            _path: Path,
-            _incremental_override: bool | None,
-            *,
-            repo_root: str | None = None,
-        ) -> None:
-            assert repo_root is not None
-            raise UnknownStyleError('badstyle')
-
-        monkeypatch.setattr('docwrap._hook._prepare_post_tool_file', raise_unknown_style)
-        event = hook_event('PostToolUse', 'Edit', {'file_path': str(f)})
-        result = _run_claude(json.dumps(event))
-        assert result == 0
-        assert 'PostToolUse unknown style' in capsys.readouterr().err
 
 
 @pytest.mark.usefixtures('registered_hosts')
@@ -3300,7 +3738,7 @@ class TestPostToolUseNewlines:
         path.write_bytes(raw)
         counts, read_bytes = _track_post_tool_io(path, monkeypatch)
 
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         first = read_bytes(path)
         assert counts == {'reads': 1, 'writes': 1}
@@ -3308,7 +3746,7 @@ class TestPostToolUseNewlines:
         _assert_uniform_newlines(first, crlf=crlf)
 
         counts.update(reads=0, writes=0)
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         assert counts == {'reads': 1, 'writes': 0}
         assert read_bytes(path) == first
@@ -3333,7 +3771,7 @@ class TestPostToolUseNewlines:
         path.write_bytes(raw)
         counts, read_bytes = _track_post_tool_io(path, monkeypatch)
 
-        hook_mod._run_post_tool_use([str(path)], str(path.parent), incremental=False)
+        hook_mod.run_post_tool([str(path)], str(path.parent), incremental=False)
 
         assert counts == {'reads': 1, 'writes': 0}
         assert read_bytes(path) == raw
@@ -3486,13 +3924,13 @@ class TestPreToolUseErrorHandling:
             assert captured.out == ''
             assert captured.err == ''
         elif allow_on_failure:
-            assert result == _Outcome('allow')
+            assert result == Outcome('allow')
             assert processed == []
             assert captured.out == ''
             assert 'WARNING' in captured.err
             assert 'target.py' in captured.err
         else:
-            assert isinstance(result, _Outcome)
+            assert isinstance(result, Outcome)
             assert result.decision == 'deny'
             assert result.reason is not None
             assert 'target.py' in result.reason
@@ -3526,8 +3964,6 @@ class TestPreToolUsePreCommitAdds:
         for name in (
             'discover_repo_root',
             'run_pre_commit_adds',
-            '_wrap_staged_blobs',
-            '_apply_commit_results',
         ):
             monkeypatch.setattr(hook_mod, name, fail_if_called)
         event = hook_event(
@@ -3799,8 +4235,6 @@ class TestPreToolUsePreCommitAdds:
         for name in (
             'discover_repo_root',
             'run_pre_commit_adds',
-            '_wrap_staged_blobs',
-            '_apply_commit_results',
         ):
             monkeypatch.setattr(hook_mod, name, fail_if_called)
         event = hook_event(
@@ -3859,6 +4293,25 @@ class TestPreToolUsePreCommitAdds:
         assert result == 0
         _assert_denied(capsys)
 
+    def test_replay_failure_reports_the_git_cause(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _init_hook_repo(tmp_path, hook_enabled=True)
+        (tmp_path / 'a.py').write_text('value = 1\n')
+        (tmp_path / '.git' / 'index.lock').touch()
+        event = hook_event(
+            'PreToolUse',
+            'Bash',
+            {'command': 'git add a.py && git commit -m x'},
+            cwd=str(tmp_path),
+        )
+
+        assert _run_claude(json.dumps(event)) == 0
+        output = json.loads(capsys.readouterr().out)
+        reason = output['hookSpecificOutput']['permissionDecisionReason']
+        assert reason.startswith('docwrap: failed to replay git add: ')
+        assert 'index.lock' in reason
+
     @pytest.mark.parametrize('allow_on_failure', [False, True], ids=['deny', 'allow'])
     def test_replay_failure_stops_before_hook_mutation(
         self,
@@ -3872,14 +4325,16 @@ class TestPreToolUsePreCommitAdds:
         def fail_if_called(*_args: object, **_kwargs: object) -> None:
             pytest.fail('downstream hook work was called')
 
-        def fail_replay(_adds: tuple[PreCommitAdd, ...]) -> bool:
-            return False
+        def fail_replay(_adds: tuple[PreCommitAdd, ...]) -> str:
+            return 'simulated failure'
 
         monkeypatch.setattr(hook_mod, 'run_pre_commit_adds', fail_replay)
         for name in (
-            '_load_staged_info',
-            '_wrap_staged_blobs',
-            '_apply_commit_results',
+            'get_staged_py_info',
+            'get_modified_tracked_py_files',
+            'resolve_pathspec_py_files',
+            'read_staged_blobs',
+            'apply_index_entries',
         ):
             monkeypatch.setattr(hook_mod, name, fail_if_called)
         event = hook_event(
@@ -3895,14 +4350,16 @@ class TestPreToolUsePreCommitAdds:
         if allow_on_failure:
             assert result == 0
             assert captured.out == ''
-            assert captured.err == 'WARNING: docwrap: failed to replay git add\n'
+            assert captured.err == (
+                'WARNING: docwrap: failed to replay git add: simulated failure\n'
+            )
         else:
             assert result == 0
             output = json.loads(captured.out)
             assert output['hookSpecificOutput']['permissionDecisionReason'] == (
-                'docwrap: failed to replay git add'
+                'docwrap: failed to replay git add: simulated failure'
             )
-            assert captured.err == 'docwrap: failed to replay git add\n'
+            assert captured.err == 'docwrap: failed to replay git add: simulated failure\n'
 
     def test_unsafe_cd_passes_through_without_touching_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -4116,7 +4573,7 @@ class TestProtocol:
             'def f(x):\n    """Summary.\n\n    Args:\n        x (int): The value.\n    """\n'
         )
 
-        hook_mod._run_post_tool_use([str(py_file)], str(py_file.parent))
+        hook_mod.run_post_tool([str(py_file)], str(py_file.parent))
 
         # The file should NOT be converted to NumPy
         result = py_file.read_text()
@@ -4167,10 +4624,6 @@ class TestProtocol:
         result = _run_claude(json.dumps(event))
         assert result == 0
         assert f.read_text() != original
-
-
-def _antigravity_hook_enabled(_cwd: str | None = None) -> bool:
-    return True
 
 
 def _fail_pathspecs(
@@ -4233,7 +4686,7 @@ def _track_post_tool_io(
         source: str,
         encoding: str,
         *,
-        raw: bytes | None = None,
+        raw: bytes,
     ) -> None:
         if candidate.resolve() == resolved:
             counts['writes'] += 1
@@ -4270,25 +4723,12 @@ def _write_permission_candidate(path: Path, *, needs_wrap: bool) -> None:
         path.write_text('def changed():\n    """Short."""\n    pass\n')
 
 
-def antigravity_payload(tool_name: str, args: dict[str, object], workspace: Path) -> str:
-    return json.dumps(
-        {
-            'toolCall': {'name': tool_name, 'args': args},
-            'workspacePaths': [str(workspace)],
-        }
-    )
-
-
-def antigravity_pretooluse_payload(cmd: str, cwd: Path) -> str:
-    return antigravity_payload('run_command', {'CommandLine': cmd, 'Cwd': str(cwd)}, cwd)
-
-
 @pytest.mark.usefixtures('registered_hosts')
 def test_antigravity_non_worktree_commit_is_silent(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    payload = antigravity_pretooluse_payload(
+    payload = _antigravity_pretooluse_payload(
         'git commit -m "test"',
         tmp_path,
     )
@@ -4316,7 +4756,7 @@ def test_antigravity_post_tool_use_uses_target_repository(
     _write_long_arg_docstring(path)
     before = path.read_text()
 
-    payload = antigravity_payload(
+    payload = _antigravity_payload(
         'write_to_file',
         {'TargetFile': str(path)},
         workspace,
@@ -4512,7 +4952,7 @@ def test_false_predecessor_is_denied_before_repository_work(
     _fail_on_repository_work(monkeypatch)
     command = 'false && git add -A && git commit -m "x"'
     if provider == 'antigravity':
-        payload = antigravity_pretooluse_payload(command, tmp_path)
+        payload = _antigravity_pretooluse_payload(command, tmp_path)
     else:
         event = hook_event('PreToolUse', 'Bash', {'command': command}, cwd=str(tmp_path))
         if provider == 'codex':
@@ -4550,7 +4990,7 @@ def test_git_global_option_is_denied(
     _fail_on_repository_work(monkeypatch)
 
     if provider == 'antigravity':
-        payload = antigravity_pretooluse_payload(command, tmp_path)
+        payload = _antigravity_pretooluse_payload(command, tmp_path)
     else:
         event = hook_event(
             'PreToolUse',
@@ -4628,7 +5068,7 @@ def test_invalid_commit_mode_is_denied_before_repository_work(
     _fail_on_repository_work(monkeypatch)
 
     if provider == 'antigravity':
-        payload = antigravity_pretooluse_payload(command, tmp_path)
+        payload = _antigravity_pretooluse_payload(command, tmp_path)
     else:
         event = hook_event('PreToolUse', 'Bash', {'command': command}, cwd=str(tmp_path))
         if provider == 'codex':
@@ -4690,7 +5130,7 @@ def test_multiline_continuation_is_supported_and_touches_nothing(
     if provider == 'codex':
         command = command.replace('git commit', f'git -C {shell_path(tmp_path)} commit', 1)
     if provider == 'antigravity':
-        payload = antigravity_pretooluse_payload(command, tmp_path)
+        payload = _antigravity_pretooluse_payload(command, tmp_path)
     else:
         event = hook_event('PreToolUse', 'Bash', {'command': command}, cwd=str(tmp_path))
         if provider == 'codex':
@@ -4731,7 +5171,7 @@ def test_nested_bootstrap_is_denied_and_does_not_touch_outer_repo(
     command = 'git init child && git -C child add example.py && git -C child commit -m "initial"'
 
     if provider == 'antigravity':
-        payload = antigravity_pretooluse_payload(command, tmp_path)
+        payload = _antigravity_pretooluse_payload(command, tmp_path)
     else:
         event = hook_event(
             'PreToolUse',
@@ -5031,10 +5471,9 @@ def test_route_permission_error_always_denies_before_acceptance(
     assert result == 0
     output = json.loads(captured.out)
     assert output['hookSpecificOutput']['permissionDecision'] == 'deny'
-    assert output['hookSpecificOutput']['permissionDecisionReason'] == (
-        'docwrap: unexpected error during classification'
-    )
-    assert captured.err == 'docwrap: unexpected error during classification\n'
+    reason = f'{_REASON_PREFIX}: unresolvable directory route; {_HINT_ROUTE}'
+    assert output['hookSpecificOutput']['permissionDecisionReason'] == reason
+    assert captured.err == f'{reason}\n'
 
 
 @pytest.mark.usefixtures('registered_hosts')
@@ -5357,8 +5796,40 @@ class TestUnknownInvocationDirectory:
         ):
             monkeypatch.setattr(hook_mod, name, explode)
 
-        outcome = hook_mod._run_pre_tool_use(
+        outcome = front_mod._run_pre_tool_use(
             'git commit -m x', None, allow_on_failure=True, incremental=None
         )
 
-        assert outcome == _Outcome('deny', _UNKNOWN_CWD_REASON)
+        assert outcome == Outcome('deny', _UNKNOWN_CWD_REASON)
+
+
+def test_worktree_sync_failure_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / 'staged.py'
+    raw = b'original\n'
+    path.write_bytes(raw)
+
+    def apply_entries(_repo_root: str, _entries: list[IndexEntry]) -> bool:
+        return True
+
+    monkeypatch.setattr(hook_mod, 'apply_index_entries', apply_entries)
+
+    def fail_sync(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk full')
+
+    monkeypatch.setattr(hook_mod, 'write_preserving_newline', fail_sync)
+    result = hook_mod._apply_commit_results(
+        str(tmp_path),
+        [IndexEntry('100644', 'hash', 'staged.py')],
+        [WorktreeWrite(path, 'replacement\n', 'utf-8', raw)],
+        allow_on_failure=False,
+    )
+
+    assert result == Outcome('allow', 'docwrap: wrapped 1 staged Python file for this commit')
+    assert (
+        capsys.readouterr().err
+        == f'WARNING: docwrap: failed to synchronize {path.as_posix()}: disk full\n'
+    )

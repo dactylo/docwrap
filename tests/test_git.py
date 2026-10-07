@@ -21,22 +21,22 @@ from docwrap._git import (
     _parse_null_separated_py_paths,
     _read_git_pathspec_file,
     _run_git_command,
-    _run_git_command_bytes,
     apply_index_entries,
     discover_repo_root,
     get_modified_tracked_py_files,
     get_repo_diff,
-    get_repo_root,
     get_staged_py_info,
+    is_head_unborn,
     is_hook_enabled,
     prepare_index_entry,
     read_staged_blobs,
     resolve_pathspec_py_files,
+    run_git_command_bytes,
     run_pre_commit_adds,
 )
-from docwrap._grammar import CommitPlan, classify_grammar
-from docwrap._shellparse import parse_command
-from docwrap._types import BaselineStatus, PreCommitAdd
+from docwrap._types import BaselineStatus
+from docwrap._vendor.hookshell._grammar import CommitPlan, PreCommitAdd, classify_grammar
+from docwrap._vendor.hookshell._shellparse import parse_command
 from tests.helpers import git_commit_all, run_setup
 
 
@@ -452,6 +452,27 @@ class TestGetRepoDiff:
         assert 'requested.py' in result
         assert 'unrelated.py' in result
 
+    def test_initial_commit_returns_none(self, tmp_path: Path) -> None:
+        run_setup(['git', 'init'], cwd=str(tmp_path))
+        f = tmp_path / 'foo.py'
+        f.write_text('x = 1\n')
+        run_setup(['git', 'add', '.'], cwd=str(tmp_path))
+        result = get_repo_diff(str(tmp_path))
+        assert result is None
+
+    def test_no_changes_returns_empty(self, tmp_path: Path) -> None:
+        run_setup(['git', 'init'], cwd=str(tmp_path))
+        f = tmp_path / 'foo.py'
+        f.write_text('x = 1\n')
+        git_commit_all(tmp_path, 'init')
+        result = get_repo_diff(str(tmp_path))
+        assert result is not None
+        assert result == ''
+
+    def test_non_repo_returns_none(self, tmp_path: Path) -> None:
+        result = get_repo_diff(str(tmp_path))
+        assert result is None
+
     @pytest.mark.parametrize(
         ('cached', 'snapshot_args'),
         [(False, []), (True, ['--cached'])],
@@ -484,6 +505,8 @@ class TestGetRepoDiff:
             'core.quotePath=false',
             'diff',
             '--no-color',
+            '--no-ext-diff',
+            '--no-textconv',
             '--src-prefix=a/',
             '--dst-prefix=b/',
             '-U0',
@@ -494,26 +517,43 @@ class TestGetRepoDiff:
             '--',
         ]
 
-    def test_initial_commit_returns_none(self, tmp_path: Path) -> None:
-        run_setup(['git', 'init'], cwd=str(tmp_path))
-        f = tmp_path / 'foo.py'
-        f.write_text('x = 1\n')
-        run_setup(['git', 'add', '.'], cwd=str(tmp_path))
-        result = get_repo_diff(str(tmp_path))
-        assert result is None
+    @pytest.mark.parametrize('cached', [False, True], ids=['worktree', 'cached'])
+    @pytest.mark.parametrize(
+        'override',
+        ['config-external', 'env-external', 'textconv'],
+    )
+    def test_diff_ignores_external_drivers(
+        self,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        cached: bool,
+        override: str,
+    ) -> None:
+        repo = git_repo
+        run_setup(['git', 'config', '--local', 'core.autocrlf', 'false'], cwd=repo)
+        path = repo / 'foo.py'
+        path.write_bytes(b'pass\n')
+        git_commit_all(repo, 'add foo')
+        if override == 'config-external':
+            run_setup(['git', 'config', '--local', 'diff.external', 'git --version'], cwd=repo)
+        elif override == 'env-external':
+            monkeypatch.setenv('GIT_EXTERNAL_DIFF', 'git --version')
+        else:
+            (repo / '.gitattributes').write_text('*.py diff=docwrap\n')
+            run_setup(
+                ['git', 'config', '--local', 'diff.docwrap.textconv', 'git --version'],
+                cwd=repo,
+            )
+            git_commit_all(repo, 'enable textconv')
+        path.write_text('value = 2\n')
+        if cached:
+            run_setup(['git', 'add', 'foo.py'], cwd=repo)
 
-    def test_no_changes_returns_empty(self, tmp_path: Path) -> None:
-        run_setup(['git', 'init'], cwd=str(tmp_path))
-        f = tmp_path / 'foo.py'
-        f.write_text('x = 1\n')
-        git_commit_all(tmp_path, 'init')
-        result = get_repo_diff(str(tmp_path))
+        result = get_repo_diff(str(repo), cached=cached)
+
         assert result is not None
-        assert result == ''
-
-    def test_non_repo_returns_none(self, tmp_path: Path) -> None:
-        result = get_repo_diff(str(tmp_path))
-        assert result is None
+        assert parse_diff_hunks(result) == {'foo.py': [(1, 1, [b'pass'])]}
 
     @pytest.mark.parametrize('cached', [False, True])
     def test_diff_uses_requested_snapshot(self, tmp_path: Path, cached: bool) -> None:
@@ -768,29 +808,17 @@ class TestGitDiffPresentation:
         assert get_eligible_ranges(modified, hunks['sample.py'], level='definition') == {(1, 5)}
 
 
-class TestGetRepoRoot:
-    def test_fallback_on_non_repo(self, tmp_path: Path) -> None:
-        result = get_repo_root(str(tmp_path))
-        assert result == str(tmp_path)
-
-    @pytest.mark.parametrize('repo_name', ['repo', 'repo '], ids=['ordinary', 'trailing-space'])
-    def test_preserves_exact_toplevel_path(self, tmp_path: Path, repo_name: str) -> None:
-        repo = tmp_path / repo_name
-        repo.mkdir()
-        run_setup(['git', 'init'], cwd=repo)
-
-        result = get_repo_root(str(repo))
-
-        assert Path(result).resolve() == repo.resolve()
-        assert Path(result).name == repo.resolve().name
-
-    def test_returns_toplevel(self, tmp_path: Path) -> None:
-        run_setup(['git', 'init'], cwd=str(tmp_path))
-        result = get_repo_root(str(tmp_path))
-        assert Path(result).resolve() == tmp_path.resolve()
-
-
 class TestGitExecutableBoundary:
+    def test_bytes_value_error_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def invalid_run(*_args: object, **_kwargs: object) -> None:
+            raise ValueError('invalid subprocess argument')
+
+        monkeypatch.setattr(subprocess, 'run', invalid_run)
+
+        assert run_git_command_bytes(['git', '--version'], str(tmp_path)) is None
+
     @pytest.mark.parametrize('boundary', ['text', 'bytes', 'add'])
     def test_uses_absolute_git_and_preserves_arguments(
         self, boundary: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -809,10 +837,14 @@ class TestGitExecutableBoundary:
         if boundary == 'text':
             assert _run_git_command(['git', *tail], cwd) is not None
         elif boundary == 'bytes':
-            assert _run_git_command_bytes(['git', *tail, b'raw-\xff.py'], cwd) is not None
+            assert run_git_command_bytes(['git', *tail, b'raw-\xff.py'], cwd) is not None
         else:
-            add = PreCommitAdd(tokens=('git', *tail), exec_cwd=cwd, git_cwd=str(tmp_path))
-            assert run_pre_commit_adds((add,))
+            add = PreCommitAdd(
+                tokens=('git', *tail),
+                exec_cwd=cwd,
+                git_cwd=str(Path(cwd) / 'nested repo'),
+            )
+            assert run_pre_commit_adds((add,)) is None
         assert len(captured) == 1
         argv, child_cwd = captured[0]
         assert isinstance(argv[0], str)
@@ -834,10 +866,10 @@ class TestGitExecutableBoundary:
         if boundary == 'text':
             assert _run_git_command(['git', '--version'], cwd) is None
         elif boundary == 'bytes':
-            assert _run_git_command_bytes(['git', '--version'], cwd) is None
+            assert run_git_command_bytes(['git', '--version'], cwd) is None
         else:
             add = PreCommitAdd(tokens=('git', 'add', '.'), exec_cwd=cwd, git_cwd=cwd)
-            assert run_pre_commit_adds((add,)) is False
+            assert run_pre_commit_adds((add,)) == 'git could not be run'
 
 
 class TestGitPathParsing:
@@ -855,7 +887,7 @@ class TestGitPathParsing:
             return subprocess.CompletedProcess([], 0, path_bytes + b'\0', b'')
 
         monkeypatch.setattr('docwrap._git._run_git_command', text_run)
-        monkeypatch.setattr('docwrap._git._run_git_command_bytes', bytes_run)
+        monkeypatch.setattr('docwrap._git.run_git_command_bytes', bytes_run)
 
         result = get_modified_tracked_py_files('/repo')
 
@@ -931,7 +963,7 @@ class TestGitPathParsing:
         def is_symlink(_path: Path) -> bool:
             return False
 
-        monkeypatch.setattr('docwrap._git._run_git_command_bytes', bytes_run)
+        monkeypatch.setattr('docwrap._git.run_git_command_bytes', bytes_run)
         monkeypatch.setattr(Path, 'exists', exists)
         monkeypatch.setattr(Path, 'is_symlink', is_symlink)
 
@@ -942,9 +974,25 @@ class TestGitPathParsing:
         assert '\ufffd' not in paths[0]
 
 
+class TestIsHeadUnborn:
+    def test_directory_outside_repository_is_not_unborn(self, tmp_path: Path) -> None:
+        assert is_head_unborn(str(tmp_path)) is False
+
+    def test_repository_with_commit_is_not_unborn(self, tmp_path: Path) -> None:
+        run_setup(['git', 'init'], cwd=tmp_path)
+        (tmp_path / 'a.py').write_text('x = 1\n')
+        git_commit_all(tmp_path, 'init')
+        assert is_head_unborn(str(tmp_path)) is False
+
+    def test_repository_without_commits_is_unborn(self, tmp_path: Path) -> None:
+        run_setup(['git', 'init'], cwd=tmp_path)
+        assert is_head_unborn(str(tmp_path)) is True
+
+
 class TestIsHookEnabled:
     def test_docwrap_hook_false_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def disabled(key: str) -> bool | None:
+        def disabled(key: str, cwd: str | None = None) -> bool | None:
+            assert cwd is None
             return False if key == 'docwrap.hook' else None
 
         monkeypatch.setattr(
@@ -962,7 +1010,8 @@ class TestIsHookEnabled:
         assert is_hook_enabled(cwd=str(tmp_path)) is False
 
     def test_docwrap_hook_true_enables(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def enabled(key: str) -> bool | None:
+        def enabled(key: str, cwd: str | None = None) -> bool | None:
+            assert cwd is None
             return True if key == 'docwrap.hook' else None
 
         monkeypatch.setattr(
@@ -972,7 +1021,8 @@ class TestIsHookEnabled:
         assert is_hook_enabled() is True
 
     def test_enabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def unset(_key: str) -> bool | None:
+        def unset(_key: str, cwd: str | None = None) -> bool | None:
+            assert cwd is None
             return None
 
         monkeypatch.setattr(
@@ -1206,12 +1256,12 @@ class TestRunPreCommitAdds:
         )
         result = run_pre_commit_adds((add,))
         staged = get_staged_py_info(str(tmp_path))
-        assert result is True
+        assert result is None
         assert staged is not None
         assert any(info.path == 'foo.py' for info in staged)
 
     def test_empty_list_is_noop(self) -> None:
-        assert run_pre_commit_adds(()) is True
+        assert run_pre_commit_adds(()) is None
 
     def test_failed_add_does_not_raise(self, tmp_path: Path) -> None:
         run_setup(['git', 'init'], cwd=str(tmp_path))
@@ -1220,7 +1270,7 @@ class TestRunPreCommitAdds:
             exec_cwd=str(tmp_path),
             git_cwd=str(tmp_path),
         )
-        assert run_pre_commit_adds((add,)) is False
+        assert run_pre_commit_adds((add,)) is not None
 
     def test_failure_preserves_prior_successful_add(self, tmp_path: Path) -> None:
         run_setup(['git', 'init'], cwd=tmp_path)
@@ -1252,7 +1302,7 @@ class TestRunPreCommitAdds:
             ),
         )
 
-        assert run_pre_commit_adds(adds) is False
+        assert run_pre_commit_adds(adds) is not None
         staged = get_staged_py_info(str(tmp_path))
         assert staged is not None
         assert any(info.path == 'first.py' for info in staged)
@@ -1262,11 +1312,9 @@ class TestRunPreCommitAdds:
     ) -> None:
         calls: list[list[str]] = []
 
-        def fail_first(
-            args: list[str], **_kwargs: object
-        ) -> subprocess.CompletedProcess[list[str]]:
+        def fail_first(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
             calls.append(args)
-            return subprocess.CompletedProcess(args, 1)
+            return subprocess.CompletedProcess(args, 1, b'', b'')
 
         monkeypatch.setattr(subprocess, 'run', fail_first)
         adds = (
@@ -1282,7 +1330,7 @@ class TestRunPreCommitAdds:
             ),
         )
 
-        assert run_pre_commit_adds(adds) is False
+        assert run_pre_commit_adds(adds) is not None
         assert len(calls) == 1
         assert Path(calls[0][0]).is_absolute()
         assert calls[0][1:] == ['add', 'first.py']
@@ -1319,12 +1367,14 @@ class TestRunPreCommitAdds:
         )
         result = run_pre_commit_adds(adds)
         staged = get_staged_py_info(str(tmp_path))
-        assert result is True
+        assert result is None
         assert staged is not None
         assert any(info.path == 'a.py' for info in staged)
         assert any(info.path == 'b.py' for info in staged)
 
-    def test_os_error_returns_false(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_os_error_returns_failure_detail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
 
         def raise_os_error(*_args: object, **_kwargs: object) -> None:
             raise OSError('injected failure')
@@ -1336,7 +1386,7 @@ class TestRunPreCommitAdds:
             git_cwd=str(tmp_path),
         )
 
-        assert run_pre_commit_adds((add,)) is False
+        assert run_pre_commit_adds((add,)) is not None
 
     def test_replays_parser_tokens_in_execution_directory(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1358,6 +1408,7 @@ class TestRunPreCommitAdds:
                 'capture_output': True,
                 'check': False,
                 'cwd': add.exec_cwd,
+                'input': None,
             }
             calls.append(args)
             return original_run(
@@ -1371,13 +1422,25 @@ class TestRunPreCommitAdds:
             patch.setattr(subprocess, 'run', record_run)
             result = run_pre_commit_adds(plan.pre_commit_adds)
 
-        assert result is True
+        assert result is None
         assert len(calls) == 1
         assert Path(calls[0][0]).is_absolute()
         assert calls[0][1:] == list(add.tokens[1:])
         staged = get_staged_py_info(str(tmp_path))
         assert staged is not None
         assert [info.path for info in staged] == ['file with spaces.py']
+
+    def test_value_error_propagates(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def invalid_run(*_args: object, **_kwargs: object) -> None:
+            raise ValueError('invalid subprocess argument')
+
+        monkeypatch.setattr(subprocess, 'run', invalid_run)
+        add = PreCommitAdd(
+            tokens=('git', 'add', '.'), exec_cwd=str(tmp_path), git_cwd=str(tmp_path)
+        )
+
+        with pytest.raises(ValueError, match='invalid subprocess argument'):
+            run_pre_commit_adds((add,))
 
 
 def _native_path_bytes(posix: bytes, windows: bytes) -> bytes:

@@ -1,8 +1,10 @@
+import warnings
 from pathlib import Path
 
 import pytest
 
 from docwrap._core._incremental import DiffHunk, get_eligible_ranges, parse_diff_hunks
+from docwrap._types import IncrementalLevel
 from tests.helpers import decode_text, run_setup
 
 
@@ -151,6 +153,16 @@ class TestEligibleRanges:
         assert result is not None
         assert (0, 0) in result  # module (key is always (0, 0))
 
+    def test_deleted_warning_source_still_selects_its_definition(self) -> None:
+        source = 'def sample():\n    """A docstring."""\n    return 1\n'
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter('error', SyntaxWarning)
+            result = get_eligible_ranges(
+                source, [(3, 2, [b'    warning = "\\q"'])], level='definition'
+            )
+        assert result == {(1, 3)}
+        assert not emitted
+
     def test_docstring_level(self) -> None:
         source = (
             'def foo():\n'  # 1
@@ -191,6 +203,16 @@ class TestEligibleRanges:
         result = get_eligible_ranges(source, [], level='definition')
         assert result is not None
         assert len(result) == 0
+
+    @pytest.mark.parametrize('level', ['file', 'definition', 'docstring'])
+    def test_source_warnings_do_not_change_eligibility(self, level: IncrementalLevel) -> None:
+        source = 'def sample():\n    """A docstring."""\n    return "\\q"\n'
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter('error', SyntaxWarning)
+            result = get_eligible_ranges(source, [(2, 2, [])], level=level)
+        expected = {'file': None, 'definition': {(1, 3)}, 'docstring': {(2, 2)}}
+        assert result == expected[level]
+        assert not emitted
 
 
 class TestIncrementalDiffWorkflow:

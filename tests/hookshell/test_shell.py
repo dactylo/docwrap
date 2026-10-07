@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from docwrap._shell import normalize_msys_path, resolve_route
+from docwrap._vendor.hookshell._shell import (
+    is_msys_mount_path,
+    normalize_msys_path,
+    resolve_route,
+)
 
 
 class TestNormalizeMsysPath:
@@ -70,6 +74,23 @@ class TestResolveRoute:
 
 def test_absolute_route_resolves_without_a_base(tmp_path: Path) -> None:
     assert resolve_route(str(tmp_path), None, logical=True) == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ('text', 'expected'),
+    [
+        ('/c', True),
+        ('/Z/repo', True),
+        ('/c/', True),
+        ('/home/repo', False),
+        ('/1', False),
+        ('/c-file', False),
+        ('C:/repo', False),
+        ('', False),
+    ],
+)
+def test_mount_syntax_must_span_the_whole_word(text: str, *, expected: bool) -> None:
+    assert is_msys_mount_path(text) is expected
 
 
 def test_relative_route_without_a_base_is_a_programming_error() -> None:

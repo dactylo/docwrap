@@ -1,6 +1,6 @@
 {
   "name": "docwrap",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Install the docwrap commit-time docstring wrapping hook for Codex.",
   "author": {
     "name": "docwrap contributors"

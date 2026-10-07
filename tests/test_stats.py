@@ -775,7 +775,7 @@ def _parse_source_full(
     except SyntaxError:
         return []
     cfg = DocwrapConfig(style=style)
-    return parse_docstrings(source, docstrings, cfg)
+    return parse_docstrings(source, docstrings, cfg, skips=[])
 
 
 class TestBuildHistogram:
@@ -976,7 +976,7 @@ class TestOpeningTitleMeasurements:
     @staticmethod
     def _measure(source: str) -> list[LineMeasurement]:
         docstrings = find_docstrings(source)
-        parsed = parse_docstrings(source, docstrings, DocwrapConfig())
+        parsed = parse_docstrings(source, docstrings, DocwrapConfig(), skips=[])
         return measure_docstring(parsed)
 
     @pytest.mark.parametrize('fence', ['```', '~~~'])
@@ -1105,7 +1105,7 @@ def _parse_for_impact(
 ) -> list[ParsedDocstring]:
     docstrings = find_docstrings(source)
     cfg = DocwrapConfig(style=style)
-    return parse_docstrings(source, docstrings, cfg)
+    return parse_docstrings(source, docstrings, cfg, skips=[])
 
 
 def _reference_per_docstring(

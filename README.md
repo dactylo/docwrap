@@ -1,8 +1,6 @@
 # docwrap
 
-[![CI](https://github.com/dactylo/docwrap/actions/workflows/ci.yml/badge.svg)](https://github.com/dactylo/docwrap/actions/workflows/ci.yml)
-
-Docwrap applies configurable formatting rules to Python docstrings. It makes wrapping and layout
+docwrap applies configurable formatting rules to Python docstrings. It makes wrapping and layout
 deterministic, with controls for line length, paragraph reflow, and summary placement. It supports
 Google, NumPy, and Sphinx/reST conventions.
 
@@ -17,7 +15,7 @@ the default 79-column limit:
 
 ## Installation
 
-Docwrap requires CPython 3.13 or later. From a checkout, install the command with
+docwrap requires CPython 3.13 or later. From a checkout, install the command with
 [uv](https://docs.astral.sh/uv/):
 
 ```bash
@@ -87,12 +85,14 @@ safety skips.
 
 ## Documentation
 
-- [CLI reference](docs/cli.md): commands, output, configuration, and exit codes.
-- [Agent hook guide](docs/hook.md): setup, commit handling, and host responses.
-- [Incremental mode](docs/incremental.md): wrap only changed files or definitions.
-- [Library reference](docs/library.md): supported Python API and result contracts.
-- [Concepts and safety](docs/design.md): styles, wrapping choices, and preservation rules.
-- [Platform compatibility](docs/platform.md): supported environments and file behavior.
+| If you want to...                                      | Read                                       |
+| ------------------------------------------------------ | ------------------------------------------ |
+| Look up commands, output, configuration, or exit codes | [CLI reference](docs/cli.md)               |
+| Set up agent hooks, commit handling, or host responses | [Agent hook guide](docs/hook.md)           |
+| Wrap only changed files or definitions                 | [Incremental mode](docs/incremental.md)    |
+| Call docwrap from Python                               | [Library reference](docs/library.md)       |
+| Choose a style and understand what docwrap preserves   | [Concepts and safety](docs/design.md)      |
+| Check supported environments and file behavior         | [Platform compatibility](docs/platform.md) |
 
 ## Development
 
@@ -104,4 +104,4 @@ repository's formatters. The Makefile also provides `make install`, `make reinst
 
 ## License
 
-Docwrap is available under the [MIT License](LICENSE).
+docwrap is available under the [MIT License](LICENSE).

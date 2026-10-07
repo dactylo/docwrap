@@ -24,7 +24,6 @@ from docwrap._cli import main
 from docwrap._config import clear_config_cache
 from docwrap._core._codeblock import find_code_block_lines
 from docwrap._core._discover import ParsedDocstring, find_docstrings, parse_docstrings
-from docwrap._core._normalize import reassemble, split_source_lines
 from docwrap._core._parse import Region, is_structural_underline, match_opening_title
 from docwrap._stats import LineMeasurement
 from docwrap._styles import EntryMatch, Style, resolve_style_override
@@ -617,7 +616,9 @@ def _verify_projection(
         assert projected_actual[actual_index] == planned_regions[region_index]
 
 
-def assert_region_projection(source: str, config: DocwrapConfig) -> None:
+def assert_region_projection(
+    source: str, config: DocwrapConfig, *, emitted_source: str | None = None
+) -> None:
     analysis = process_module.analyze_source(source, config)
     assert not analysis.parse_error
     assert analysis.skips == ()
@@ -626,10 +627,8 @@ def assert_region_projection(source: str, config: DocwrapConfig) -> None:
     render = wrap_module._render_with_deltas
     render_options = wrap_module._RenderOptions
     convert = process_module._convert_parsed_regions
-    splice = process_module._splice_literal
 
     plans: list[_ProjectionPlan] = []
-    literals: list[str] = []
     for parsed in analysis.parsed:
         if config.convert is not None and parsed.detected_name == config.convert:
             wrap_style = parsed.style
@@ -649,18 +648,6 @@ def assert_region_projection(source: str, config: DocwrapConfig) -> None:
         projected_lines = tuple(
             _ProjectedLine(region_index=line.region_index, text=line.text) for line in rendered
         )
-        wrapped = '\n'.join(line.text for line in projected_lines)
-        literal = reassemble(
-            wrapped,
-            parsed.lit.quote_char,
-            parsed.lit.prefix,
-            parsed.base_indent,
-            config,
-            col_offset=parsed.col_offset,
-            original_position=parsed.original_position,
-            source_margin=parsed.source_margin,
-        )
-        assert literal is not None
         plans.append(
             _ProjectionPlan(
                 lines=projected_lines,
@@ -668,20 +655,15 @@ def assert_region_projection(source: str, config: DocwrapConfig) -> None:
                 style=target_style,
             )
         )
-        literals.append(literal)
 
-    emitted_lines = split_source_lines(source)
-    for parsed, literal in reversed(list(zip(analysis.parsed, literals, strict=True))):
-        splice(emitted_lines, parsed.info, literal)
-    emitted_source = ''.join(emitted_lines)
+    if emitted_source is None:
+        emitted_source = process_module.wrap_source_report(source, config=config).source
     emitted_docstrings = find_docstrings(emitted_source)
     assert len(emitted_docstrings) == len(plans)
 
     for info, plan in zip(emitted_docstrings, plans, strict=True):
         reparsed = parse_docstrings(
-            emitted_source,
-            [info],
-            _target_config(config, plan.style),
+            emitted_source, [info], _target_config(config, plan.style), skips=[]
         )
         assert len(reparsed) == 1
         _verify_projection(plan, reparsed[0])

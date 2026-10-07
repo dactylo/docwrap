@@ -24,12 +24,13 @@ class Recommendation:
 
 def _format_rationale(
     prefix: str,
-    lines_added: int,
-    lines_removed: int,
-    docs: int,
-    files: int,
+    row: ImpactRow,
 ) -> str:
-    """Format a human-readable rationale string."""
+    """Describe a target's projected docstring and line changes."""
+    lines_added = row.lines_added
+    lines_removed = row.lines_removed
+    docs = row.docstrings_changed
+    files = row.files_changed
     if docs == 0 and lines_added == 0 and lines_removed == 0:
         return f'{prefix} No changes needed.'
     if lines_added == 0 and docs > 0:
@@ -58,13 +59,7 @@ def _best_fit(
     best = min(candidates, key=lambda ln: (abs(ln - source_p95), ln))
 
     row = impact[best]
-    rationale = _format_rationale(
-        'Closest target to p95.',
-        row.lines_added,
-        row.lines_removed,
-        row.docstrings_changed,
-        row.files_changed,
-    )
+    rationale = _format_rationale('Closest target to p95.', row)
     return best, rationale
 
 
@@ -76,13 +71,7 @@ def _configured(
     if configured_length not in impact:
         return None
     row = impact[configured_length]
-    rationale = _format_rationale(
-        'Your configured length.',
-        row.lines_added,
-        row.lines_removed,
-        row.docstrings_changed,
-        row.files_changed,
-    )
+    rationale = _format_rationale('Your configured length.', row)
     return configured_length, rationale
 
 
@@ -101,9 +90,7 @@ def _low_churn(
         ),
     )
     row = impact[best]
-    rationale = _format_rationale(
-        '', row.lines_added, row.lines_removed, row.docstrings_changed, row.files_changed
-    )
+    rationale = _format_rationale('', row)
     return best, rationale.lstrip()
 
 

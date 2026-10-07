@@ -34,7 +34,7 @@ repos:
         types: [python]
 ```
 
-Install the docwrap CLI from a checkout and make sure `docwrap` is on `PATH`, then run
+Install the `docwrap` CLI from a checkout and make sure `docwrap` is on `PATH`, then run
 `pre-commit install`. The writing hook updates files and pre-commit asks you to stage the result.
 For a report-only hook, change `entry` to `docwrap`; it exits 1 when wrapping is pending and does
 not edit files. This integration is separate from the agent hooks below.
@@ -71,7 +71,7 @@ redundantly re-process them at commit time.
 ### Plugin packages
 
 Use this checkout as the marketplace source. The plugins package only hook configuration, so
-install the docwrap CLI first and confirm that `docwrap` is on `PATH`.
+install the `docwrap` CLI first and confirm that `docwrap` is on `PATH`.
 
 Install the Claude Code plugin from a docwrap checkout:
 
@@ -324,22 +324,25 @@ the allow or deny decision never depend on the adapter, and an adapter cannot ch
 - Any other event or tool is nothing docwrap acts on: silent exit 0.
 
 An unknown host, a host registered twice, an adapter that fails to import or reports a different
-`docwrap.hooks.API_VERSION`, a missing or unexpected `--event`, an adapter that raises while
-parsing, or an adapter whose `render` and `render_failure` both raise is the last resort: one
-`docwrap:` line on stderr, nothing on stdout, exit 2. See Host adapters below for what exit 2 means
-on each host.
+`docwrap.hooks.API_VERSION`, or adapter metadata (`api_version` or `requires_event`) that raises
+reaches the last resort. So does a missing or unexpected `--event`, parsed input with fields that
+are missing, raise, or have the wrong type, and a rendered response whose fields are missing,
+raise, or have the wrong type when `render_failure` cannot provide a valid response. docwrap
+validates the whole response before writing either stream. The last resort writes one `docwrap:`
+line on stderr, nothing on stdout, and exits 2. See Host adapters below for what exit 2 means on
+each host.
 
 ## PreToolUse
 
 Every pre-tool shell command receives exactly one of three outcomes:
 
 1. **Unrelated.** No commit invocation is detected. Silent allow, no repository work.
-2. **Supported commit.** The complete command belongs to the closed grammar below. Docwrap formats
+2. **Supported commit.** The complete command belongs to the closed grammar below. docwrap formats
    the content the commit will consume, then allows. A grammar-accepted command that is proven not
    to commit, a status-only commit or a routing `cd` whose target does not exist, allows with no
    repository work.
 3. **Unsupported commit.** A commit invocation is detected and the command is outside the grammar.
-   Docwrap denies before any repository discovery, add replay, index read, index write, or
+   docwrap denies before any repository discovery, add replay, index read, index write, or
    working-tree write, with a reason that names the first unsupported element and the nearest
    accepted form, for example
    `docwrap: unsupported commit command: segment 'git push'; supported form: [cd DIR &&] [git add ...;] git commit ...`.
@@ -394,8 +397,8 @@ For a real commit, the grammar accepts this sequence, where `SEP` is `&&`, `;`, 
 - Existing proven no-commit forms (status-only commits and missing route targets) still allow
   read-only segments before the final commit with no pathspecs or positional arguments and only
   these options: `status` accepts `-s`, `-b`, any nonempty short-option cluster containing only `s`
-  and `b` (including repeated letters), `--short`, `--porcelain`, `--porcelain=v1`, `--branch`,
-  `--untracked-files=all`, and `-l`; `diff` accepts `--cached`, `--staged`, `--check`, `--stat`,
+  and `b` (including repeated letters), `--short`, `--porcelain`, `--porcelain=v1`, `--branch`, and
+  `--untracked-files=all`; `diff` accepts `--cached`, `--staged`, `--check`, `--stat`,
   `--name-only`, and `--name-status`; `log` accepts `--oneline`, `--stat`, `--format=LITERAL`,
   `-N`, and `-n N`. `--output` and `--no-index` are excluded because a later add could stage what
   they produce.
@@ -441,17 +444,27 @@ are accepted and proven noncommitting. Everything else, including `-p`, `--patch
 is unsupported.
 
 The detector decides whether a rejected command contains a commit invocation that the shell, a
-listed evaluator, or a listed interpreter executes: a word naming Git by basename (`git` or
-`git.exe` in any letter case after the last `/` or `\`) followed later in the same segment by a
-`commit` word; a word carrying an expansion followed later in the same segment by a `commit` word;
-every command substitution, including inside double quotes and inside `${...}` expansions; every
-heredoc body, scanned once for the substitutions an unquoted delimiter expands, once as a shell
-script, and once as a quote-stripped token stream for a `git` token followed by a `commit` token;
-the script arguments of `sh`, `bash`, `zsh`, `dash`, or `ksh` after a `-c` cluster; the joined
-arguments of `eval`; and the inline script after `-c` or `-e` of `node`, `perl`, `ruby`, or any
-`python*`, scanned as the same token stream. Each distinct evaluator or heredoc script is parsed
-and scanned at most once per detector call; the results are discarded when the call ends. ANSI-C
-quoting (`$'...'`) is unsupported: unescaped contents retain their literal word text for detection,
+listed evaluator, or a listed interpreter executes. Shell, `eval`, and interpreter names match the
+final `/` or `\` path component in any letter case; shells and interpreters also match with an
+`.exe` suffix. A backtick substitution has one backslash escape layer removed before parsing, as
+the shell does. A quoted heredoc fed to plain `cat` or `tee` writing to a file is data when that is
+the command's only segment. Pipes, process substitution, descriptor duplication, wrappers such as
+`sudo` or assignments, an unquoted delimiter, and commands chained before or after the data sink
+are still scanned. The detector examines: a word naming Git by basename (`git` or `git.exe` in any
+letter case after the last `/` or `\`) followed later in the same segment by a `commit` word; a
+word carrying an expansion followed later in the same segment by a `commit` word; every command
+substitution, including inside double quotes and inside `${...}` expansions; each heredoc body
+outside that quoted plain `cat`/`tee` exception, scanned once for the substitutions an unquoted
+delimiter expands, once as a shell script, and once as a quote-stripped token stream for a `git`
+token followed by a `commit` token; the script arguments of `sh`, `bash`, `zsh`, `dash`, or `ksh`
+after a `-c` cluster; the joined arguments of `eval`; and the inline script after `-c` or `-e` of
+`node`, `perl`, `ruby`, or any `python*`, scanned as the same token stream. Each distinct evaluator
+or heredoc script is parsed and scanned at most once per detector call; the results are discarded
+when the call ends. Unterminated heredoc bodies are scanned in place during script detection,
+sharing overlapping token and expansion scans. This preserves conservative detection without
+repeatedly parsing the remaining lines. Quoted bodies still receive the script scan outside that
+plain `cat`/`tee` data-sink exception, and `<<-` tab stripping is retained. ANSI-C quoting
+(`$'...'`) is unsupported: unescaped contents retain their literal word text for detection,
 including concatenated parts such as `com$'mit'`; contents with backslash escapes remain opaque
 like dynamic expansions. The detector does not evaluate escapes or predict computed subcommands
 such as `git $ACTION`. A parse that needed recovery (unsupported ANSI-C quoting, unbalanced quotes,
@@ -604,9 +617,14 @@ Preceding `git add` commands are replayed so the hook can inspect the content th
 but neither replay nor Git's path selection authorizes a working-tree write. An ordinary unfiltered
 file added immediately before a commit normally satisfies the equality check and is synchronized.
 
+If a synchronization write fails after the index update, docwrap attempts to restore the
+working-tree file's original bytes and reports the failure as a `WARNING:` line. The warning names
+a failed restoration if those bytes could not be restored. The commit is not blocked by a
+synchronization failure.
+
 Git attributes can make the staged and working-tree representations differ even without a user
 edit. For example, an `ident` attribute stores `$Id$` in the index while expanding it in the
-working tree. Docwrap still wraps the index entry, but the representation difference prevents a
+working tree. docwrap still wraps the index entry, but the representation difference prevents a
 working-tree write. When the original compound command later runs its real `git add`, Git may
 replace docwrap's wrapped index entry with the clean-side form of the unchanged, unwrapped
 working-tree file, leaving that file unwrapped for the commit. This safe no-op is preferred to
@@ -624,8 +642,9 @@ working-tree files fall back to full wrapping, even without `--allow-on-failure`
 objects and staged contents that cannot be decoded are skipped. Other Git infrastructure failures,
 including malformed or truncated staged-content output and absent per-path results, deny the commit
 by default. Add replay failures, blob-creation failures, and index-update failures also deny by
-default. Pass `--allow-on-failure` to warn on stderr, return silent success, and leave
-authorization to the provider.
+default. An add-replay denial includes Git's first error line so the cause is visible. Pass
+`--allow-on-failure` to warn on stderr, return silent success, and leave authorization to the
+provider.
 
 ### Syntax errors
 
@@ -641,26 +660,27 @@ means only that docwrap did not block the command; it does not grant provider pe
 
 ## Security considerations
 
-Docwrap never authorizes the intercepted command. Claude Code, Codex, and Antigravity receive no
+docwrap never authorizes the intercepted command. Claude Code, Codex, and Antigravity receive no
 permission-decision stdout on success, so each provider applies the user's normal permission prompt
 and allowlist rules. Informational safety-skip stderr does not change that behavior.
 
-| Outcome                                   | Claude Code                                   | Codex                                         | Antigravity                                   |
-| ----------------------------------------- | --------------------------------------------- | --------------------------------------------- | --------------------------------------------- |
-| Unrelated, no-op, or working-tree rewrite | Exit 0, silent                                | Exit 0, silent                                | Exit 0, silent                                |
-| Staged-index rewrite                      | `systemMessage` with file count, exit 0       | `systemMessage` with file count, exit 0       | `systemMessage` with file count, exit 0       |
-| Safety skip                               | Info on stderr, exit 0                        | Info on stderr, exit 0                        | Info on stderr, exit 0                        |
-| Unsupported commit                        | Deny JSON on stdout, reason on stderr, exit 0 | Deny JSON on stdout, reason on stderr, exit 0 | Top-level deny JSON, reason on stderr, exit 0 |
-| Failure, fail-closed                      | Deny JSON on stdout, reason on stderr, exit 0 | Deny JSON on stdout, reason on stderr, exit 0 | Top-level deny JSON, reason on stderr, exit 0 |
-| Failure, allow-on-failure                 | Warning on stderr, exit 0                     | Warning on stderr, exit 0                     | Warning on stderr, exit 0                     |
-| Last resort (no functioning adapter)      | One line on stderr, exit 2: blocks            | One line on stderr, exit 2: blocks            | One line on stderr, exit 2: does not block    |
+| Outcome                                   | Claude Code                                     | Codex                                           | Antigravity                                   |
+| ----------------------------------------- | ----------------------------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| Unrelated, no-op, or working-tree rewrite | Exit 0, silent                                  | Exit 0, silent                                  | Exit 0, silent                                |
+| Staged-index rewrite                      | `systemMessage` with file count, exit 0         | `systemMessage` with file count, exit 0         | `systemMessage` with file count, exit 0       |
+| Safety skip                               | Info on stderr, exit 0                          | Info on stderr, exit 0                          | Info on stderr, exit 0                        |
+| PostToolUse diagnostic                    | Context JSON on stdout, notes on stderr, exit 0 | Context JSON on stdout, notes on stderr, exit 0 | Notes on stderr, exit 0                       |
+| Unsupported commit                        | Deny JSON on stdout, reason on stderr, exit 0   | Deny JSON on stdout, reason on stderr, exit 0   | Top-level deny JSON, reason on stderr, exit 0 |
+| Failure, fail-closed                      | Deny JSON on stdout, reason on stderr, exit 0   | Deny JSON on stdout, reason on stderr, exit 0   | Top-level deny JSON, reason on stderr, exit 0 |
+| Failure, allow-on-failure                 | Warning on stderr, exit 0                       | Warning on stderr, exit 0                       | Warning on stderr, exit 0                     |
+| Last resort (no functioning adapter)      | One line on stderr, exit 2: blocks              | One line on stderr, exit 2: blocks              | One line on stderr, exit 2: does not block    |
 
 Hook mutations happen before the provider's permission decision and may remain if that later
 decision rejects the commit. For normal commits, docwrap may already have rewritten staged blobs
 and synchronized safe working-tree copies. For the one supported compound add, such as
 `git add foo.py && git commit`, docwrap pre-executes that add so it can inspect the content the
 commit would use; the staging change may remain if later wrapping, provider approval, or command
-execution fails. Docwrap cannot observe or roll back those outcomes. Add replay is not
+execution fails. docwrap cannot observe or roll back those outcomes. Add replay is not
 transactional.
 
 Run `git config docwrap.hook false` in a repository to opt out of hook processing and its index or
@@ -688,9 +708,12 @@ file edits, or Antigravity `write_to_file` and `replace_file_content` edits. It:
    style and encoding.
 
 Exceptions during file processing are caught and logged to stderr. Expected errors (`OSError`,
-`UnicodeDecodeError`, `SyntaxError`, `UnknownStyleError`) print a one-line message; unexpected
-exceptions print a full traceback. The PostToolUse handler never blocks Claude Code (always returns
-0).
+`UnicodeDecodeError`, `SyntaxError`) print a one-line message; unexpected exceptions print a full
+traceback. Claude Code and Codex also receive diagnostic lines, deduplicated in order, as
+`hookSpecificOutput.additionalContext` JSON on stdout. The notes remain on stderr. Antigravity
+receives stderr only, and an invocation without diagnostics stays silent. PostToolUse always
+returns 0. If a write fails, docwrap attempts to restore the original bytes. Restoration is not
+guaranteed; a failed restoration is reported in the diagnostic line.
 
 ### Skip conditions (PostToolUse)
 
@@ -731,41 +754,42 @@ eligible. Tracked files with no changed hunks remain untouched. See the
 ## Composing with other hooks
 
 Agent runtimes may run matching hooks concurrently. For Claude Code and Codex, when two hooks can
-rewrite the same staged file, register one sequencer command for the event and matcher, with each
-formatter as an ordered step. A Codex manual hook can invoke:
+rewrite the same staged file, register one sequencing hook for the event and matcher, with each
+formatter as an ordered step. Each step runs its own formatter command with its own agent
+selection, for example `docwrap hook --agent codex` under Codex or `docwrap hook --agent claude`
+under Claude Code. The sequencer must pass the same payload to each step and apply each host
+response before moving to the next one. In particular, a formatter deny is JSON on stdout with exit
+0; the sequencer must honor it. Do not also register standalone formatter plugins for that event,
+or the formatters may run twice.
 
-```sh
-sequential-hooks --agent codex --step-timeout 30 defsort hook --agent codex -- docwrap hook --agent codex
-```
+Add replay and index updates take Git's index lock. When two hooks run concurrently for the same
+commit, such as docwrap and defsort registered as separate plugins, one can fail with
+`failed to replay git add: ... index.lock ...`. Register them as steps of one sequencing hook.
 
-For Claude Code, use `claude` in all three agent selections. The sequencer passes the same payload
-to each step and applies each host response before moving to the next one. In particular, a
-formatter deny is JSON on stdout with exit 0; the sequencer must honor it. Do not also register
-standalone formatter plugins for that event, or the formatters may run twice.
+**Antigravity limitation:** After a staged rewrite, docwrap's Antigravity response carries a
+`systemMessage` receipt. A sequencer whose `agy` adapter rejects that field as an unexpected
+response stops with a deny. Do not run docwrap as a step of such a sequencer under Antigravity. Two
+standalone formatter hooks may run concurrently and race over the same staged files, so they are
+not a substitute for ordered composition. Do not weaken deny handling to conceal the
+incompatibility.
 
-**Antigravity limitation:** The current `agy` sequencer adapter rejects a successful formatter
-`systemMessage` as an unexpected response and stops with a deny. A staged rewrite by docwrap or
-defsort can produce that message. Do not compose these formatters through
-`sequential-hooks --agent agy` in this state. Two standalone formatter hooks may run concurrently
-and race over the same staged files, so they are not a substitute for ordered composition. Do not
-weaken deny handling to conceal the incompatibility.
-
-Docwrap cannot roll back a staged rewrite if a later hook fails. The
+docwrap cannot roll back a staged rewrite if a later hook fails. The
 [security considerations](#security-considerations) describe other mutations that may remain after
 a provider denies the command.
 
 ## Exit codes
 
-| Code | Meaning                                                             |
-| ---- | ------------------------------------------------------------------- |
-| 0    | Every rendered response: allow, deny, warning, PostToolUse          |
-| 2    | Last resort: no functioning agent adapter, one diagnostic on stderr |
+| Code | Meaning                                                                                    |
+| ---- | ------------------------------------------------------------------------------------------ |
+| 0    | Every rendered response: allow, deny, warning, PostToolUse                                 |
+| 2    | Last resort: no functioning agent adapter, or stdout closed at startup; one line on stderr |
 
 A deny is carried by the host's JSON on stdout, not by the exit status. Exit 2 blocks on Claude
 Code and Codex, which document exit 2 as blocking; Antigravity has no exit-code tier, so the last
-resort does not block there. When docwrap runs under a wrapper, the wrapper's own agent adapter
-decides what a child's nonzero exit means; that protection is the wrapper's contract, not
-docwrap's.
+resort does not block there. A stdout that is already closed when docwrap starts gets the same
+status, with `error: standard output is unavailable` on stderr, because no response can reach the
+host. When docwrap runs under a wrapper, the wrapper's own agent adapter decides what a child's
+nonzero exit means; that protection is the wrapper's contract, not docwrap's.
 
 ## Error handling
 
@@ -775,11 +799,15 @@ docwrap's.
   on stdout and the reason line on stderr with exit 0.
 - `--allow-on-failure` turns infrastructure failures after a command is accepted into a warning on
   stderr and a silent allow. It never applies to unsupported commits or to the last resort.
-- PostToolUse reports errors on stderr and always returns 0.
+- PostToolUse reports errors on stderr and always returns 0. Claude Code and Codex also receive
+  diagnostic context JSON on stdout when diagnostics are present; Antigravity receives stderr only.
+- A stdout that is already closed when docwrap starts produces
+  `error: standard output is unavailable` on stderr and exit 2 for every event, as the last resort
+  does, before the payload is read.
 
 ## Host adapters
 
-Docwrap reaches each host through an adapter that implements the public `docwrap.hooks` contract
+docwrap reaches each host through an adapter that implements the public `docwrap.hooks` contract
 (see the [library reference](library.md)). Adapters are discovered through the
 `docwrap.hook_adapters` entry-point group; the built-in `claude`, `codex`, and `agy` adapters are
 registered in that group like any other. An adapter translates: it turns the host payload into
@@ -817,7 +845,7 @@ myhost = "docwrap_host_myhost.adapter:MyHostAdapter"
 
 Install the adapter package into the same Python environment as docwrap, then register the hook
 command as `docwrap hook --agent myhost`. A host whose payload carries no event name sets
-`requires_event` and receives `--event`. Docwrap refuses an adapter whose `api_version` differs
+`requires_event` and receives `--event`. docwrap refuses an adapter whose `api_version` differs
 from its own and a name registered by two distributions.
 
 Failure tiers:
@@ -826,10 +854,13 @@ Failure tiers:
    the selected adapter's `render` or `render_failure`. The adapter encodes the host's real
    enforcement protocol; the core never chooses an exit code.
 2. When no functioning adapter exists (unknown or duplicate name, import failure, wrong
-   `api_version`, `parse` raising, or both `render` and `render_failure` raising), docwrap writes
-   one diagnostic line to stderr and exits 2 with nothing on stdout. Exit 2 blocks on Claude Code
-   and Codex and does not block on Antigravity. Docwrap cannot protect a chain from the failure of
-   its own adapter.
+   `api_version`, adapter metadata that raises, `parse` raising, parsed input fields that are
+   missing, raise, or have the wrong type, or both render paths failing), docwrap writes one
+   diagnostic line to stderr and exits 2 with nothing on stdout. Rendered response fields are
+   validated before either stream is written; malformed fields use `render_failure` if it produces
+   a valid response, otherwise they reach this last resort. Exit 2 blocks on Claude Code and Codex
+   and does not block on Antigravity. docwrap cannot protect a chain from the failure of its own
+   adapter.
 
 ## Differences from CLI
 
@@ -841,7 +872,7 @@ Failure tiers:
 | Incremental       | Off by default          | Off by default              | Off by default                                                                                                  |
 | Diff output       | `--diff` flag           | Not supported               | Not supported                                                                                                   |
 | Report output     | Summary table           | Not supported               | Not supported                                                                                                   |
-| Error reporting   | stderr + exit code 2    | Deny or warn (configurable) | stderr (always returns 0)                                                                                       |
+| Error reporting   | stderr + exit code 2    | Deny or warn (configurable) | Claude Code/Codex: context JSON on stdout and notes on stderr; Antigravity: stderr only (always returns 0)      |
 | Scope             | Explicit paths/dirs     | Staged `.py` files          | One path for Claude Code/Antigravity; one or more deduplicated touched paths from a Codex `apply_patch` command |
 | Directory recurse | Yes                     | No                          | No                                                                                                              |
 | Encoding          | Preserved               | Preserved                   | Preserved                                                                                                       |

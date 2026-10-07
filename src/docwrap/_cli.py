@@ -1,4 +1,4 @@
-"""CLI entry point for docwrap."""
+"""Non-hook CLI commands for docwrap."""
 
 import argparse
 import logging
@@ -8,9 +8,10 @@ import tokenize
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast, override
 
-from docwrap._color import should_color, visible_controls
+from docwrap._arguments import incremental_override
+from docwrap._color import path_text, should_color, visible_controls
 from docwrap._config import (
     ResolvedConfig,
     effective_config,
@@ -29,12 +30,11 @@ from docwrap._core._incremental import (
     parse_diff_hunks,
     resolve_incremental_level,
 )
-from docwrap._downstream import closable_stdout, stdout_closed
+from docwrap._downstream import stdout_closed
 from docwrap._exceptions import UnknownStyleError
 from docwrap._files import (
     ReadResult,
     collect_files,
-    ensure_utf8_stdio,
     read_file,
     read_file_result,
     write_preserving_newline,
@@ -45,7 +45,9 @@ from docwrap._git import (
     discover_repo_root,
     get_repo_diff,
     get_tracked_files,
+    is_head_unborn,
 )
+from docwrap._main import main as entry_main
 from docwrap._styles import get_styles
 from docwrap._types import (
     COLOR_MODES,
@@ -68,6 +70,10 @@ from docwrap._types import (
 if TYPE_CHECKING:
     from docwrap._display._json import JsonFileRecord
     from docwrap._stats import ImpactRow, LineMeasurement, StatsData
+
+_COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ('commands', (('hook', 'run as a coding-agent hook (see docwrap hook --help)'),)),
+)
 
 _DEFAULT_CONFIG = DocwrapConfig()
 _DEFAULT_RESOLVED = ResolvedConfig(config=DocwrapConfig())
@@ -138,6 +144,30 @@ class _IncrementalRepositoryState:
     warnings: list[str]
 
 
+class _RootParser(argparse.ArgumentParser):
+    """Render the option groups, then the commands that have their own parsers."""
+
+    @override
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        if formatter is None:
+            formatter = self._get_formatter()
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.description)
+        for action_group in self._action_groups:
+            formatter.start_section(action_group.title)
+            formatter.add_text(action_group.description)
+            formatter.add_arguments(action_group._group_actions)  # noqa: SLF001
+            formatter.end_section()
+        for title, commands in _COMMAND_GROUPS:
+            formatter.start_section(title)
+            formatter.add_arguments(
+                [argparse.Action([], name, help=text) for name, text in commands]
+            )
+            formatter.end_section()
+        formatter.add_text(self.epilog)
+        return formatter.format_help()
+
+
 @dataclass(frozen=True, slots=True)
 class _WrappedFile:
     """Result of reading, resolving config, and wrapping a single file."""
@@ -146,7 +176,7 @@ class _WrappedFile:
     encoding: str
     config: DocwrapConfig
     report: WrapReport
-    raw: bytes | None
+    raw: bytes
     show_skips: bool
 
 
@@ -176,44 +206,9 @@ def _argv_requests_help(args_list: list[str]) -> bool:
     return False
 
 
-def _build_hook_parser() -> argparse.ArgumentParser:
-    """Build the argument parser for the hook subcommand."""
-    parser = argparse.ArgumentParser(
-        prog='docwrap hook',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description='Agent hook entry point; reads the host payload as JSON from stdin.',
-    )
-    parser.add_argument(
-        '-a',
-        '--agent',
-        required=True,
-        metavar='NAME',
-        help='Installed coding-agent adapter name.',
-    )
-    parser.add_argument(
-        '-e',
-        '--event',
-        metavar='NAME',
-        help='Host event name; required only for hosts without an event in the payload.',
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        '-i',
-        '--incremental',
-        action='store_true',
-        help='Enable incremental wrapping at the configured level (default: definition).',
-    )
-    group.add_argument(
-        '--no-incremental',
-        action='store_true',
-        help='Disable incremental wrapping, even when configured.',
-    )
-    parser.add_argument(
-        '--allow-on-failure',
-        action='store_true',
-        help='Allow accepted commands on hook failures; unsupported commits still deny.',
-    )
-    return parser
+def _classify_file_failure(error: Exception) -> _FileFailureKind:
+    """Classify a file failure for planning and JSON output."""
+    return 'error' if isinstance(error, (OSError, UnicodeDecodeError)) else 'invalid'
 
 
 def _classify_missing_incremental_paths(
@@ -261,6 +256,10 @@ def _collect_incremental_repository_state(
         )
         state.path_to_rel.update(zip(root_files, relative_paths, strict=True))
         diff_output = get_repo_diff(root)
+        if diff_output is None and is_head_unborn(root):
+            # Without a commit, every file is new.
+            state.untracked.update(root_files)
+            continue
         root_hunks = None if diff_output is None else parse_diff_hunks(diff_output)
         if root_hunks is None:
             if incr_explicit:
@@ -303,11 +302,16 @@ def _collect_stats(
     docstring_files = 0
     skipped = 0
     safety_skips = 0
+    unparseable = 0
 
     for path in files:
         try:
             source, _ = read_file(path)
-        except (OSError, UnicodeDecodeError, SyntaxError):
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            print(
+                f'error: {visible_controls(path_text(path))}: {visible_controls(str(error))}',
+                file=sys.stderr,
+            )
             skipped += 1
             continue
 
@@ -317,6 +321,8 @@ def _collect_stats(
 
         analysis = analyze_source(source, effective_cfg)
         if analysis.parse_error:
+            print(f'error: {visible_controls(path_text(path))}: failed to parse', file=sys.stderr)
+            unparseable += 1
             continue
 
         for skip in analysis.skips:
@@ -361,6 +367,7 @@ def _collect_stats(
         skipped_count=skipped,
         source_measurements=all_source_measurements,
         safety_skip_count=safety_skips,
+        unparseable_count=unparseable,
     )
 
 
@@ -383,18 +390,17 @@ def _compute_file_plan(
         else:
             try:
                 read_result = read_file_result(path)
-            except (OSError, UnicodeDecodeError) as error:
+            except (
+                OSError,
+                UnicodeDecodeError,
+                SyntaxError,
+                tokenize.TokenError,
+                ValueError,
+            ) as error:
                 plan = _FilePlan(
                     state='failed',
                     eligible_ranges=None,
-                    failure_kind='error',
-                    diagnostic=str(error),
-                )
-            except (SyntaxError, tokenize.TokenError, ValueError) as error:
-                plan = _FilePlan(
-                    state='failed',
-                    eligible_ranges=None,
-                    failure_kind='invalid',
+                    failure_kind=_classify_file_failure(error),
                     diagnostic=str(error),
                 )
             else:
@@ -411,7 +417,7 @@ def _compute_file_plan(
                         state='failed',
                         eligible_ranges=None,
                         prepared=prepared,
-                        failure_kind='invalid',
+                        failure_kind=_classify_file_failure(error),
                         diagnostic=str(error),
                     )
                 else:
@@ -536,13 +542,9 @@ def _format_default(value: object, source: str) -> str:
     return f'(default: {value}, from {source})'
 
 
-def _incremental_override(args: argparse.Namespace) -> bool | None:
-    """Map CLI incremental switches to a tri-state override."""
-    if args.no_incremental:
-        return False
-    if args.incremental:
-        return True
-    return None
+def _on_off(value: bool) -> str:
+    """Return the help-text spelling of a boolean default."""
+    return 'on' if value else 'off'
 
 
 def _parse_stats_longest(value: str) -> int:
@@ -601,142 +603,164 @@ def _build_parser(resolved: ResolvedConfig | None = None) -> argparse.ArgumentPa
         _config_field_source(help_config, 'summary_start'),
     )
     wrap_summary_default = _format_default(
-        help_config.wrap_summary,
+        _on_off(help_config.wrap_summary),
         _config_field_source(help_config, 'wrap_summary'),
     )
+    show_skips_default = _format_default(
+        _on_off(resolved_cfg.show_skips),
+        'default' if resolved_cfg.show_skips == _DEFAULT_RESOLVED.show_skips else '[tool.docwrap]',
+    )
+    incremental_level = (
+        f' (level: {resolved_cfg.incremental}, from [tool.docwrap])'
+        if isinstance(resolved_cfg.incremental, str)
+        else ''
+    )
 
-    parser = argparse.ArgumentParser(
+    parser = _RootParser(
         prog='docwrap',
+        usage='%(prog)s [options] [PATH ...]',
         description='Wrap Python docstrings to a configured line length.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=('subcommands:\n  hook    Agent hook entry point (see docwrap hook --help)'),
     )
-    wrapping_policy_group = parser.add_argument_group('wrapping policy options')
-    style_group = parser.add_argument_group('style options')
-    statistics_group = parser.add_argument_group('statistics options')
-    parser.add_argument('paths', nargs='*', default=['.'], help='Python files or directories.')
-    parser.add_argument('--version', action='store_true', help='Show the installed version.')
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        '-p', '--preview', action='store_true', help='Show per-docstring before/after.'
+    parser.add_argument(
+        'paths',
+        nargs='*',
+        default=['.'],
+        metavar='PATH',
+        help='files or directories to check (default: current directory)',
     )
-    mode_group.add_argument(
+    parser.add_argument('--version', action='store_true', help='show the version and exit')
+    output = parser.add_argument_group('output (choose one)')
+    modes = output.add_mutually_exclusive_group()
+    modes.add_argument(
+        '-p', '--preview', action='store_true', help='show each docstring that would change'
+    )
+    modes.add_argument('-d', '--diff', action='store_true', help='show a unified diff')
+    modes.add_argument('-w', '--write', action='store_true', help='rewrite files in place')
+    modes.add_argument('-j', '--json', action='store_true', help='print results as JSON')
+    modes.add_argument(
         '-s',
         '--stats',
         action='store_true',
-        help='Show line length statistics.',
+        help='report docstring line lengths and help choose a line length',
     )
-    mode_group.add_argument('-d', '--diff', action='store_true', help='Show unified diff.')
-    mode_group.add_argument('-j', '--json', action='store_true', help='Output to JSON.')
-    mode_group.add_argument('-w', '--write', action='store_true', help='Modify files in place.')
-    parser.add_argument(
+    wrapping = parser.add_argument_group('wrapping')
+    wrapping.add_argument(
         '-l',
         '--length',
         type=int,
         dest='line_length',
-        help=f'Target line length {length_default}.',
+        metavar='N',
+        help=f'maximum line length {length_default}',
     )
-    parser.add_argument(
+    wrapping.add_argument(
+        '--reflow',
+        choices=REFLOW_MODES,
+        default=None,
+        help=f'how freely to rejoin lines before wrapping {reflow_default}',
+    )
+    wrapping.add_argument(
+        '--fill-style',
+        choices=FILL_STYLES,
+        default=None,
+        help=f'how to choose line breaks {fill_style_default}',
+    )
+    wrapping.add_argument(
+        '--smart-slack',
+        type=int,
+        default=None,
+        metavar='N',
+        help=(
+            f'columns smart fill may give up to avoid a stranded fragment {smart_slack_default}'
+        ),
+    )
+    wrapping.add_argument(
+        '--summary-start',
+        choices=SUMMARY_STARTS,
+        default=None,
+        help=f'where a multi-line summary starts {summary_start_default}',
+    )
+    wrapping.add_argument(
+        '--wrap-summary',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=f'wrap summaries longer than the line length {wrap_summary_default}',
+    )
+    wrapping.add_argument(
+        '--style',
+        choices=sorted(get_styles()),
+        help="use this docstring style instead of detecting each docstring's style",
+    )
+    conversion = parser.add_argument_group('conversion')
+    conversion.add_argument(
+        '--convert',
+        choices=sorted(get_styles()),
+        help='rewrite docstrings in another style',
+    )
+    conversion.add_argument(
+        '--strip-types',
+        action='store_true',
+        default=False,
+        help='remove inline types from structured entries, such as param (str):',
+    )
+    selection = parser.add_argument_group('selection')
+    selection.add_argument(
         '-i',
         '--incremental',
         action='store_true',
         default=False,
-        help=(
-            'Enable incremental mode with the configured level (default when unset: definition).'
-        ),
+        help=f'wrap only docstrings affected by changes since the last commit{incremental_level}',
     )
-    parser.add_argument('-v', '--verbose', action='store_true', help='Include unchanged files.')
-    parser.add_argument(
-        '--color',
-        choices=COLOR_MODES,
-        default='auto',
-        help=f'Color output {color_default}.',
+    selection.add_argument(
+        '--incremental-level',
+        choices=INCREMENTAL_LEVELS,
+        default=None,
+        help='how much around each change to wrap; implies --incremental',
     )
-    parser.add_argument(
+    selection.add_argument(
         '--no-incremental',
         action='store_true',
         default=False,
-        help='Explicitly disable incremental mode.',
+        help='wrap every docstring, even when configuration enables incremental mode',
     )
-    skip_group = parser.add_mutually_exclusive_group()
-    skip_group.add_argument(
+    display = parser.add_argument_group('display')
+    display.add_argument('-v', '--verbose', action='store_true', help='also list unchanged files')
+    display.add_argument(
+        '--color',
+        choices=COLOR_MODES,
+        default='auto',
+        help=f'when to use color {color_default}',
+    )
+    skips = display.add_mutually_exclusive_group()
+    skips.add_argument(
         '--show-skips',
         action='store_true',
         default=None,
         dest='show_skips',
-        help='Show skipped-summary diagnostics in preview output.',
+        help=(
+            'in preview, list summaries left unwrapped because they are too long '
+            f'{show_skips_default}'
+        ),
     )
-    skip_group.add_argument(
+    skips.add_argument(
         '--hide-skips',
         action='store_false',
         dest='show_skips',
-        help='Hide skipped-summary diagnostics in preview output.',
+        help='in preview, do not list summaries left unwrapped because they are too long',
     )
-    wrapping_policy_group.add_argument(
-        '--incremental-level',
-        choices=INCREMENTAL_LEVELS,
-        default=None,
-        help='Override incremental level (enables incremental).',
-    )
-    wrapping_policy_group.add_argument(
-        '--summary-start',
-        choices=SUMMARY_STARTS,
-        default=None,
-        help=f'Summary position relative to opening quotes {summary_start_default}.',
-    )
-    wrapping_policy_group.add_argument(
-        '--wrap-summary',
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=f'Wrap summary lines that exceed the target length {wrap_summary_default}.',
-    )
-    wrapping_policy_group.add_argument(
-        '--fill-style',
-        choices=FILL_STYLES,
-        default=None,
-        help=f'Fill style: balanced, greedy, or smart {fill_style_default}.',
-    )
-    wrapping_policy_group.add_argument(
-        '--smart-slack',
-        type=int,
-        default=None,
-        help=f'Smart-fill break-repair budget {smart_slack_default}.',
-    )
-    wrapping_policy_group.add_argument(
-        '--reflow',
-        choices=REFLOW_MODES,
-        default=None,
-        help=f'Reflow mode: none, cautious, or full {reflow_default}.',
-    )
-    style_group.add_argument(
-        '--style',
-        choices=sorted(get_styles()),
-        help='Override docstring style.',
-    )
-    style_group.add_argument(
-        '--convert',
-        choices=sorted(get_styles()),
-        help='Convert docstrings to the specified style.',
-    )
-    style_group.add_argument(
-        '--strip-types',
-        action='store_true',
-        default=False,
-        help='Strip inline type annotations from docstrings.',
-    )
-    statistics_group.add_argument(
+    statistics = parser.add_argument_group('statistics')
+    statistics.add_argument(
         '--stats-sections',
         type=_parse_stats_sections,
         default=None,
         metavar='SECTION[,SECTION...]',
-        help='Stats body sections, shown once in the listed order.',
+        help='report sections to show, in order',
     )
-    statistics_group.add_argument(
+    statistics.add_argument(
         '--stats-longest-per-category',
         type=_parse_stats_longest,
         default=None,
         metavar='N',
-        help='Longest lines shown per wrappable category in stats mode (default: 3).',
+        help='longest lines to list per category (default: 3)',
     )
     return parser
 
@@ -762,11 +786,11 @@ def _resolve_help_config() -> ResolvedConfig:
 
 def _resolve_incremental(
     args: argparse.Namespace,
-    file_config_incremental: IncrementalLevel | bool | None,
+    file_config_incremental: IncrementalLevel | Literal[False] | None,
 ) -> tuple[IncrementalLevel | None, bool]:
     """Resolve effective incremental level and whether it was explicit."""
     level = resolve_incremental_level(
-        override=_incremental_override(args),
+        override=incremental_override(args),
         explicit_level=args.incremental_level,
         config_value=file_config_incremental,
     )
@@ -789,32 +813,6 @@ def _resolve_mode(args: argparse.Namespace) -> tuple[OutputMode, DetailLevel]:
     if args.json:
         return 'json', 'diff'
     return 'summary', 'summary'
-
-
-def _run_hook(argv: list[str]) -> int:
-    """Handle the hook subcommand."""
-    hook_parser = _build_hook_parser()
-    args = hook_parser.parse_args(argv)
-
-    if sys.stdin.isatty():
-        print('docwrap hook: reads the host hook payload as JSON from stdin')
-        print('See docs/hook.md for configuration.')
-        return 0
-
-    try:
-        stdin_data = sys.stdin.read()
-    except (ValueError, OSError):
-        return 0
-
-    from docwrap._hook import run_hook  # noqa: PLC0415
-
-    return run_hook(
-        stdin_data,
-        host=args.agent,
-        event=args.event,
-        allow_on_failure=args.allow_on_failure,
-        incremental=_incremental_override(args),
-    )
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -884,7 +882,7 @@ def _process_file(
     incr_level: IncrementalLevel | None,
     options: _FileModeOptions,
 ) -> FileResult:
-    """Process a single file."""
+    """Wrap one selected file and render its requested output."""
     try:
         wf = _wrap_file_once(
             path,
@@ -898,14 +896,14 @@ def _process_file(
         return FileResult(status=_EXIT_ERROR, path=path)
     except (SyntaxError, UnicodeDecodeError, ValueError, OSError) as e:
         print(
-            f'error: {visible_controls(str(path))}: {visible_controls(str(e))}',
+            f'error: {visible_controls(path_text(path))}: {visible_controls(str(e))}',
             file=sys.stderr,
         )
         return FileResult(status=_EXIT_ERROR, path=path)
 
     report = wf.report
     if report.parse_error:
-        print(f'error: {visible_controls(str(path))}: failed to parse', file=sys.stderr)
+        print(f'error: {visible_controls(path_text(path))}: failed to parse', file=sys.stderr)
         return FileResult(status=_EXIT_ERROR, path=path)
 
     from docwrap._display._skips import format_safety_skip  # noqa: PLC0415
@@ -921,9 +919,9 @@ def _process_file(
     result = report.source
     docstrings = report.docstrings if options.mode == 'preview' else ()
 
-    if result == wf.source:
+    def file_result(status: int) -> FileResult:
         return FileResult(
-            status=_EXIT_OK,
+            status=status,
             path=path,
             line_length=effective_length,
             total=report.total,
@@ -933,41 +931,30 @@ def _process_file(
             show_skips=show_skips,
         )
 
+    if result == wf.source:
+        return file_result(_EXIT_OK)
+
     if options.mode == 'write':
         try:
             write_preserving_newline(path, result, wf.encoding, raw=wf.raw)
         except OSError as e:
             print(
-                f'error: {visible_controls(str(path))}: {visible_controls(str(e))}',
+                f'error: {visible_controls(path_text(path))}: {visible_controls(str(e))}',
                 file=sys.stderr,
             )
-            return FileResult(
-                status=_EXIT_ERROR,
-                path=path,
-                line_length=effective_length,
-                total=report.total,
-                wrapped=report.wrapped,
-                skipped_summaries=report.skipped_summaries,
-                docstrings=docstrings,
-                show_skips=show_skips,
-            )
+            return file_result(_EXIT_ERROR)
 
     if options.mode == 'diff':
         from docwrap._display import iter_diff  # noqa: PLC0415
 
-        sys.stdout.writelines(iter_diff(wf.source, result, str(path), color=options.color))
+        sys.stdout.writelines(
+            iter_diff(
+                wf.source, result, str(path), color=options.color, terminal=sys.stdout.isatty()
+            )
+        )
 
     status = _EXIT_OK if options.mode == 'write' else _EXIT_CHANGED
-    return FileResult(
-        status=status,
-        path=path,
-        line_length=effective_length,
-        total=report.total,
-        wrapped=report.wrapped,
-        skipped_summaries=report.skipped_summaries,
-        docstrings=docstrings,
-        show_skips=show_skips,
-    )
+    return file_result(status)
 
 
 def _process_file_json(
@@ -992,10 +979,8 @@ def _process_file_json(
             incr_level,
             detail='diff',
         )
-    except (OSError, UnicodeDecodeError) as e:
-        return json_error_record(str_path, 'error', str(e))
-    except (SyntaxError, tokenize.TokenError, ValueError) as e:
-        return json_error_record(str_path, 'invalid', str(e))
+    except (OSError, UnicodeDecodeError, SyntaxError, tokenize.TokenError, ValueError) as error:
+        return json_error_record(str_path, _classify_file_failure(error), str(error))
 
     report = wf.report
     if report.parse_error:
@@ -1025,7 +1010,8 @@ def _run_file_mode(
         if file_plan.state == 'failed':
             assert file_plan.diagnostic is not None  # noqa: S101 -- failed-plan invariant
             print(
-                f'error: {visible_controls(str(path))}: {visible_controls(file_plan.diagnostic)}',
+                f'error: {visible_controls(path_text(path))}: '
+                f'{visible_controls(file_plan.diagnostic)}',
                 file=sys.stderr,
             )
             results.append(FileResult(status=_EXIT_ERROR, path=path))
@@ -1060,7 +1046,7 @@ def _run_json_mode(
     files: list[Path],
     incr_ctx: _IncrementalContext,
 ) -> int:
-    """Handle JSON output mode."""
+    """Collect per-file records and emit the JSON result envelope."""
     from docwrap._display import format_json, json_error_record  # noqa: PLC0415
 
     logging.getLogger('docwrap').setLevel(logging.CRITICAL)
@@ -1118,10 +1104,10 @@ def _print_stats(
     *,
     files: list[Path],
     args: argparse.Namespace,
-) -> None:
-    """Collect and print stats output."""
+) -> bool:
+    """Collect and print stats output, reporting whether any file failed."""
     if not files:
-        return
+        return False
 
     with render_config_warnings():
         stats_cfg = find_stats_config(files[0])
@@ -1173,44 +1159,41 @@ def _print_stats(
         sections=sections,
         longest_per_category=longest_per_category,
     )
+    return data.skipped_count > 0 or data.unparseable_count > 0
 
 
 def _run_stats_mode(args: argparse.Namespace, files: list[Path]) -> int:
-    """Handle stats output mode."""
+    """Measure selected files and render the requested statistics."""
     try:
-        _print_stats(files=files, args=args)
+        failed = _print_stats(files=files, args=args)
     except UnknownStyleError as error:
         print(f'error: {visible_controls(str(error))}', file=sys.stderr)
         return _EXIT_ERROR
-    return _EXIT_OK
+    return _EXIT_ERROR if failed else _EXIT_OK
 
 
-def _run_cli(argv: Sequence[str] | None) -> int:
+def run_cli(args: list[str]) -> int:
     """Process CLI arguments and run the requested command."""
-    ensure_utf8_stdio()
-    args_list = sys.argv[1:] if argv is None else list(argv)
-    if args_list and args_list[0] == 'hook':
-        return _run_hook(args_list[1:])
-    help_cfg = _resolve_help_config() if _argv_requests_help(args_list) else None
+    help_cfg = _resolve_help_config() if _argv_requests_help(args) else None
     parser = _build_parser(help_cfg)
-    args = parser.parse_args(args_list)
-    if args.version:
+    options = parser.parse_args(args)
+    if options.version:
         return _print_version()
-    _validate_args(parser, args)
+    _validate_args(parser, options)
 
-    mode, detail = _resolve_mode(args)
-    files = collect_files(args.paths)
+    mode, detail = _resolve_mode(options)
+    files = collect_files(options.paths)
     if mode == 'stats':
-        return _run_stats_mode(args, files)
+        return _run_stats_mode(options, files)
 
-    overrides = _wrap_overrides(args)
+    overrides = _wrap_overrides(options)
 
-    if args.no_incremental or args.incremental_level is not None:
+    if options.no_incremental or options.incremental_level is not None:
         file_config_incr = None
     else:
         with render_config_warnings():
             file_config_incr = find_incremental_config(files[0]) if files else None
-    incr_level, incr_explicit = _resolve_incremental(args, file_config_incr)
+    incr_level, incr_explicit = _resolve_incremental(options, file_config_incr)
     incr_outcome = _compute_incremental_context(files, incr_level, incr_explicit)
     diagnostic = incr_outcome.diagnostic
 
@@ -1246,38 +1229,27 @@ def _run_cli(argv: Sequence[str] | None) -> int:
 
     with render_config_warnings():
         color_config = find_color_config()
-    color = should_color(sys.stdout, cli_flag=args.color, config_value=color_config)
+    color = should_color(sys.stdout, cli_flag=options.color, config_value=color_config)
 
     opts = _FileModeOptions(
         mode=mode,
         detail=detail,
-        verbose=args.verbose,
+        verbose=options.verbose,
         color=color,
     )
     return _run_file_mode(overrides, files, incr_ctx, opts)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the CLI command and emit its output and diagnostics.
-
-    Configure standard streams for UTF-8 where supported before processing
-    arguments. If stdout closes, discard remaining output, examine no further
-    files, and return the status of work completed so far.
+    """Run the command-line interface through the shared entry point.
 
     Args:
-        argv: Command-line arguments, or `None` to use `sys.argv[1:]`.
+        argv: Arguments to parse, or `None` to use `sys.argv`.
 
     Returns:
-        For file and statistics commands, 0 on success, including successful
-        writes; 1 when changes remain pending; or 2 on processing errors.
-        Hook commands use host-specific exit statuses, or 2 when no functioning
-        adapter is available.
-
-    Raises:
-        SystemExit: When argument parsing displays help or rejects arguments.
+        The process exit status.
     """
-    with closable_stdout():
-        return _run_cli(argv)
+    return entry_main(argv)
 
 
 if __name__ == '__main__':

@@ -47,8 +47,8 @@ _PROSE_LIKE = frozenset(
 )
 
 
-class NumpyStyle:
-    """Concrete `Style` implementation for NumPy-style docstrings."""
+class _NumpyStyle:
+    """Parse and format NumPy-style docstrings."""
 
     name: StyleName = 'numpy'
     known_headers = _ENTRY_LIKE | _PROSE_LIKE
@@ -191,6 +191,18 @@ class NumpyStyle:
             return []
         return [name, '-' * len(name)]
 
+    def is_conservative_entry_candidate(self, content: str) -> bool:
+        """Leave NumPy entry detection to the normal matcher.
+
+        Args:
+            content: Unused line content after the entry indentation.
+
+        Returns:
+            `False` because NumPy needs no conservative check.
+        """
+        del content
+        return False
+
     def is_section_header(self, line: str, next_line: str | None = None) -> str | None:
         """Return section name if line + next_line form a NumPy header.
 
@@ -288,5 +300,5 @@ class NumpyStyle:
         return role in _NUMPY_CANONICAL_TO_HEADER
 
 
-_INSTANCE = NumpyStyle()
+_INSTANCE = _NumpyStyle()
 STYLE = _INSTANCE

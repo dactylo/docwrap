@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import re
+import sys
 import typing
 from collections.abc import Callable
 from dataclasses import fields
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import docwrap
+from tests.helpers import process_transcript, run_setup
 
 EXPECTED_EXPORTS = frozenset(
     {
@@ -67,6 +69,54 @@ class TestInternalImportPaths:
     @pytest.mark.parametrize('name', ['docwrap._core', 'docwrap._display', 'docwrap._styles'])
     def test_new_subpackage_paths_importable(self, name: str) -> None:
         assert importlib.import_module(name) is not None
+
+
+class TestLazyFacade:
+    def test_dir_lists_every_export(self) -> None:
+        assert callable(docwrap.__dir__)
+        assert callable(docwrap.__getattr__)
+        assert set(docwrap.__all__) <= set(dir(docwrap))
+
+    def test_exports_are_library_objects(self) -> None:
+        library = importlib.import_module('docwrap._library')
+        assert list(library.__all__) == list(docwrap.__all__)
+        for name in docwrap.__all__:
+            assert getattr(docwrap, name) is getattr(library, name)
+
+    def test_first_access_in_fresh_interpreter_loads_library_lazily(self) -> None:
+        script = (
+            'import sys\n'
+            'import docwrap\n'
+            "assert 'docwrap._library' not in sys.modules, 'library loaded at import'\n"
+            "assert 'docwrap._core' not in sys.modules, 'engine loaded at import'\n"
+            "assert not hasattr(docwrap, '_cli')\n"
+            'from docwrap import _color\n'
+            "assert 'docwrap._library' not in sys.modules, 'library loaded by probes'\n"
+            'for name in docwrap.__all__:\n'
+            '    getattr(docwrap, name)\n'
+            "assert 'docwrap._library' in sys.modules\n"
+        )
+        result = run_setup([sys.executable, '-c', script], check=False)
+        assert result.returncode == 0, process_transcript(result)
+
+    def test_library_import_failure_surfaces_on_first_access(self) -> None:
+        script = (
+            'import sys\n'
+            "sys.modules['docwrap._library'] = None\n"
+            'import docwrap\n'
+            'try:\n'
+            '    docwrap.wrap_source\n'
+            'except ImportError:\n'
+            '    sys.exit(0)\n'
+            'sys.exit(1)\n'
+        )
+        result = run_setup([sys.executable, '-c', script], check=False)
+        assert result.returncode == 0, process_transcript(result)
+
+    def test_unexported_name_is_not_an_attribute(self) -> None:
+        name = 'wrap_source_report_eligible'
+        with pytest.raises(AttributeError):
+            getattr(docwrap, name)
 
 
 class TestPublicFacade:

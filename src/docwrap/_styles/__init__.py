@@ -6,20 +6,12 @@ from typing import Literal, Protocol
 
 from docwrap._types import CanonicalRole, SectionKind, SphinxFieldRole, StyleName
 
-__all__ = [
-    'EntryMatch',
-    'Style',
-    'get_style',
-    'get_styles',
-    'resolve_style_override',
-]
-
 
 @dataclass(frozen=True, slots=True)
 class EntryMatch:
     """A matched entry line within a structured section.
 
-    Args:
+    Attributes:
         name: Entry name, or an empty string for unnamed return-like entries.
         type_ann: Parsed type annotation, or an empty string.
         description: Parsed entry description, or an empty string.
@@ -147,6 +139,17 @@ class Style(Protocol):
         Returns:
             The formatted section-header lines, or an empty list when the style
             has no matching header.
+        """
+        ...
+
+    def is_conservative_entry_candidate(self, content: str) -> bool:
+        """Check if section-body content could become an entry after indentation.
+
+        Args:
+            content: Line content after the entry indentation.
+
+        Returns:
+            Whether to protect the content from an entry-forming indent shift.
         """
         ...
 

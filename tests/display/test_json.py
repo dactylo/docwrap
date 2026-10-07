@@ -99,12 +99,14 @@ class TestSkipFields:
         assert data['version'] == 1
         assert data['total_skips'] == 0
 
-    def test_error_record_has_empty_skips(self) -> None:
-        record = json_error_record('a.py', 'error', 'boom')
-        assert record['skips'] == []
-
     def test_total_skips_sums_records(self) -> None:
         rec = json_error_record('a.py', 'error', 'boom')
         rec['skips'] = [{'line': 1, 'qualname': 'f', 'code': 'line-continuation', 'message': 'm'}]
         data = json.loads(format_json([rec, json_error_record('b.py', 'error', 'x')]))
         assert data['total_skips'] == 1
+
+
+def test_windows_json_path_keeps_native_spelling() -> None:
+    path = r'C:\repo\file.py'
+    record = json_error_record(path, 'error', 'unreadable')
+    assert json.loads(format_json([record]))['files'][0]['path'] == path
